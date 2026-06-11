@@ -1,0 +1,54 @@
+# Builds the Vite bundle and (optionally) deploys it to GitHub Pages.
+#
+# The live demo currently deploys via "Pages → Deploy from a branch → /docs",
+# which serves the committed docs/ tree directly and needs no build. This
+# workflow is the *additive* path introduced by ADR-0003 / EDGENET T0.1:
+#   - build + test run on every push/PR (catch build regressions early),
+#   - deploy runs ONLY on manual dispatch, so it never fights the existing
+#     branch-based Pages deploy.
+#
+# To make the bundled build the live site: set Pages source to "GitHub Actions"
+# in repo settings, then uncomment the `push` trigger on the deploy job (or just
+# run this workflow from the Actions tab). See docs/DEV.md.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    # Opt-in only: deploy when triggered manually, so this never overrides the
+    # current branch-based Pages deploy until the repo owner switches the Pages
+    # source to "GitHub Actions".
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

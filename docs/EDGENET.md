@@ -70,7 +70,7 @@ the per-layer ADRs 0002–0008.
 
 ## Phase 0 — Foundation: build system, identity, schema
 
-- [ ] **T0.1 — Adopt a bundler (Vite) + npm** · _depends: none_ · _ADR: [0003](./adrs/0003-adopt-bundler-and-npm.md)_
+- [x] **T0.1 — Adopt a bundler (Vite) + npm** · _depends: none_ · _ADR: [0003](./adrs/0003-adopt-bundler-and-npm.md)_ — done: `package.json` + `vite.config.js` (root `docs/`, `base: './'`, build → `dist/`); `npm run dev|build|preview|test`; three.js is now an npm dep, wasm bundles via `new URL(…, import.meta.url)`; deploy via [`.github/workflows/pages.yml`](../.github/workflows/pages.yml) (build/test on push/PR, deploy on dispatch). See [`docs/DEV.md`](./DEV.md). Verified 2D+3D+wasm under dev, the built bundle, and the `/skygraph/` subpath.
   - Goal: introduce a build step so we can use npm packages (QuDAG, HNSW, etc.)
     without breaking the GitHub Pages deploy.
   - Do: add `package.json`, Vite config; entry = current `docs/index.html`;

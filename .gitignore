@@ -1,5 +1,8 @@
 /target
 **/target
 node_modules
+# Vite build output (ADR-0003 / EDGENET T0.1). The committed docs/ tree stays
+# the no-build deploy source; the bundled build is produced into dist/ on demand.
+/dist
 # NOTE: docs/pkg (the built wasm engine) is deliberately committed so the
 # GitHub Pages demo works without a build step.

@@ -36,6 +36,8 @@ python3 -m http.server 8000
 
 The prebuilt WASM engine is committed at `docs/pkg/`, so this works with no toolchain at all.
 
+Want a dev server with HMR (and the npm packages the [EdgeNet roadmap](docs/EDGENET.md) needs)? There's now an optional Vite build — `npm install && npm run dev` — that does **not** replace the no-build path above. See [`docs/DEV.md`](docs/DEV.md) ([ADR-0003](docs/adrs/0003-adopt-bundler-and-npm.md)).
+
 ## The ⚙ drawer
 
 Top-right gear: toggle layers (aircraft / satellites / sun & moon / trails / labels / conflict alerts), pick the satellite TLE group, set trail length, try the WebGPU satellite renderer, and arm pass notifications. Settings persist in `localStorage`.
@@ -86,7 +88,7 @@ The full pipeline — RuVector `VectorDB` similarity search, the SkyGraph proper
 cargo run -p sky-monitor --release     # synthetic-day demo + SkyGraph + brief
 cargo test -p sky-monitor              # acceptance tests (ADR-199 §31)
 cargo test -p sky-monitor-wasm         # wasm crate (native-parity, SGP4, screen mapping)
-node --test docs/test/                 # behavior + CPA detectors
+node --test docs/test/*.test.mjs       # behavior + CPA detectors (or: npm test)
 ```
 
 ## Data sources (all free, no keys, CORS-friendly)

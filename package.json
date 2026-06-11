@@ -1,0 +1,20 @@
+{
+  "name": "skygraph",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Realtime all-sky dashboard + the EdgeNet federated-mesh roadmap. The app lives in docs/ (served statically); Vite is the additive dev/build tool (ADR-0003).",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test docs/test/*.test.mjs"
+  },
+  "devDependencies": {
+    "vite": "^8.0.16"
+  },
+  "dependencies": {
+    "three": "^0.160.0"
+  }
+}
