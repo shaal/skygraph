@@ -80,7 +80,7 @@ the per-layer ADRs 0002–0008.
     working; `npm run build` produces deployable static assets; the committed
     `docs/pkg` wasm still loads; CI/Pages deploy path documented.
 
-- [ ] **T0.2 — Spike: validate the QuDAG/Synaptic-Mesh browser transport** · _depends: T0.1_ · _ADR: [0002](./adrs/0002-networking-substrate-qudag-synaptic-mesh.md)_
+- [x] **T0.2 — Spike: validate the QuDAG/Synaptic-Mesh browser transport** · _depends: T0.1_ · _ADR: [0002](./adrs/0002-networking-substrate-qudag-synaptic-mesh.md)_ — done: **deferred**. `qudag-wasm` (crate 0.1.0, not on npm) is crypto-only — its networking is `cfg(not(wasm32))`; `core/network` libp2p has no `webrtc` transport; `synaptic-mesh` is a prototype with "P2P not implemented". Serverless browser-to-browser Gossipsub also needs a relay+STUN server. Decision recorded in [ADR-0002 Appendix A](./adrs/0002-networking-substrate-qudag-synaptic-mesh.md#appendix-a--t02-spike-report-browser-transport): ship Phase 1 on the `BroadcastChannel` simulator (T1.2), keep the T1.1 `MeshTransport` QuDAG-shaped, swap real transport in later.
   - Goal: de-risk the prototype-stage dependency before building on it.
   - Do: get `qudag-wasm` (or `synaptic-mesh`) running in two browser contexts;
     join a Gossipsub topic; exchange one signed hello message. Pin exact
@@ -245,7 +245,7 @@ Pull into a phase when a dependency lands. Detail in [ADR-0001](./adrs/0001-fede
 
 ## Open questions for ruvnet (confirm, then record as ADRs)
 
-1. Substrate specifics: edge-net P2P mesh **or** QuDAG DAG as the primary transport, and is `qudag-wasm` browser-ready today? (drives T0.2)
+1. Substrate specifics: edge-net P2P mesh **or** QuDAG DAG as the primary transport, and is `qudag-wasm` browser-ready today? (drives T0.2) — _**browser-readiness answered by the T0.2 spike: no** (qudag-wasm is crypto-only on wasm; edge-net needs a signaling server) → Phase 1 ships on the simulator. The edge-net-vs-QuDAG **direction** is still ruvnet's to confirm. See [ADR-0002 App. A](./adrs/0002-networking-substrate-qudag-synaptic-mesh.md#appendix-a--t02-spike-report-browser-transport)._
 2. Is **rUv** a real credit/token here or just a contribution metric? (drives [ADR-0008](./adrs/0008-trust-and-incentives.md))
 3. Data licensing + privacy stance for shared tracks. (drives [ADR-0007](./adrs/0007-contributor-privacy.md))
 4. Identity: adopt **Pi-Key** as specified, or Ed25519/WebCrypto for v1? (drives [ADR-0004](./adrs/0004-signed-observation-and-identity.md))
