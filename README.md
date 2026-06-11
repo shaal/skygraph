@@ -88,7 +88,7 @@ The full pipeline — RuVector `VectorDB` similarity search, the SkyGraph proper
 cargo run -p sky-monitor --release     # synthetic-day demo + SkyGraph + brief
 cargo test -p sky-monitor              # acceptance tests (ADR-199 §31)
 cargo test -p sky-monitor-wasm         # wasm crate (native-parity, SGP4, screen mapping)
-node --test docs/test/*.test.mjs       # behavior + CPA detectors (or: npm test)
+node --test docs/test/*.test.mjs       # behavior, CPA, mesh Observation (or: npm test)
 ```
 
 ## Data sources (all free, no keys, CORS-friendly)

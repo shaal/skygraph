@@ -31,7 +31,7 @@ npm install      # first time only
 npm run dev      # dev server with HMR at http://localhost:5173/
 npm run build    # bundle to ./dist (gitignored), deployable static assets
 npm run preview  # serve ./dist to verify the production build
-npm test         # node --test docs/test/  (behavior + CPA detectors)
+npm test         # node --test docs/test/  (behavior, CPA, mesh Observation)
 ```
 
 How the pieces map under Vite (see [`vite.config.js`](../vite.config.js)):
@@ -47,6 +47,13 @@ How the pieces map under Vite (see [`vite.config.js`](../vite.config.js)):
   `.wasm` into the build as a hashed asset automatically. Nothing to configure.
 - **base** is `./` (relative URLs) so the bundle works under the `/skygraph/`
   Pages subpath and from any file server.
+- **mesh modules** live in `src/mesh/` (e.g. `observation.js`, [ADR-0004](./adrs/0004-signed-observation-and-identity.md)),
+  *outside* the Vite root (`docs/`). A `docs/` module importing `../src/mesh/…`
+  resolves under `npm run dev` (Vite rewrites it to a `/@fs/…` URL) and
+  `npm run build` (Rollup bundles it) — but **not** under the no-build path #1,
+  which serves only `docs/`. So mesh features require the Vite path (they pull
+  npm packages anyway, per ADR-0003). Their node-tests live in `docs/test/` so
+  `npm test` picks them up.
 
 ## Deploy
 

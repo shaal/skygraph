@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skygraph.local/edgenet/schemas/observation.schema.json",
+  "title": "EdgeNet Observation",
+  "description": "The signed, versioned wire unit gossiped across the EdgeNet mesh (ADR-0004). One node's report of one target. Carries only a coarse obsCell, never raw observer coordinates (ADR-0007). The canonical bytes signed are this object minus `sig`, JSON-serialized with recursively sorted keys; the reference implementation is src/mesh/observation.js.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "kind", "target", "t", "az", "el", "obsCell", "nodeId", "sig"],
+  "properties": {
+    "v": {
+      "description": "Schema version. Gates evolution; receivers ignore (do not crash on) unknown future versions.",
+      "const": 1
+    },
+    "kind": {
+      "description": "Observation modality.",
+      "enum": ["aircraft", "satellite", "sensor"]
+    },
+    "target": {
+      "description": "Stable target id within the kind: icao24 | norad | sensor-id.",
+      "type": "string",
+      "minLength": 1
+    },
+    "t": {
+      "description": "Observation time, unix seconds (UTC).",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "az": {
+      "description": "Target azimuth in the observer frame, degrees [0, 360].",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 360
+    },
+    "el": {
+      "description": "Target elevation in the observer frame, degrees [-90, 90].",
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90
+    },
+    "range_m": {
+      "description": "Slant range in metres, if known. Often absent for passive bearing-only receivers (MLAT recovers position downstream).",
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "obsCell": {
+      "description": "COARSE observer location as a geohash (≈±2.4 km at precision 5). NEVER raw lat/lon — privacy is enforced by the wire format (ADR-0007).",
+      "type": "string",
+      "pattern": "^[0-9bcdefghjkmnpqrstuvwxyz]{1,12}$"
+    },
+    "payload": {
+      "description": "Kind-specific extras (callsign, alt_m, rssi, §13 embedding ref, ...). The format's extensibility point.",
+      "type": "object"
+    },
+    "nodeId": {
+      "description": "Self-certifying pseudonymous identity: the node's Ed25519 public key as pk:<base58>. Receivers verify `sig` directly from this — no key distribution (ADR-0004).",
+      "type": "string",
+      "pattern": "^pk:[1-9A-HJ-NP-Za-km-z]+$"
+    },
+    "sig": {
+      "description": "base64 Ed25519 signature over the canonical bytes (this object minus `sig`).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$"
+    }
+  }
+}

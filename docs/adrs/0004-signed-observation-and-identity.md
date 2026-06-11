@@ -1,6 +1,7 @@
 # ADR-0004: Signed Observation as the exchange unit + node identity
 
-- Status: Proposed
+- Status: Accepted (v1 ships Ed25519/WebCrypto — T0.3; Pi-Key revisited if/when
+  the QuDAG transport lands, see [ADR-0002 App. A](./0002-networking-substrate-qudag-synaptic-mesh.md#appendix-a--t02-spike-report-browser-transport))
 - Date: 2026-06-11
 - Deciders: shaal (ruvnet to confirm Pi-Key)
 - Related: [ADR-0002](./0002-networking-substrate-qudag-synaptic-mesh.md), [ADR-0007](./0007-contributor-privacy.md), [EDGENET.md](../EDGENET.md) §T0.3

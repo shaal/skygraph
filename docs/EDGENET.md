@@ -92,7 +92,7 @@ the per-layer ADRs 0002–0008.
     real API surface (join, publish, subscribe, sign/verify), versions pinned,
     and a runnable `examples/mesh-spike/` or a documented fallback decision.
 
-- [ ] **T0.3 — Signed `Observation` schema + identity helpers** · _depends: T0.1_ · _ADR: [0004](./adrs/0004-signed-observation-and-identity.md)_
+- [x] **T0.3 — Signed `Observation` schema + identity helpers** · _depends: T0.1_ · _ADR: [0004](./adrs/0004-signed-observation-and-identity.md)_ — done: [`src/mesh/observation.js`](../src/mesh/observation.js). Identity is **Ed25519/WebCrypto** (the ADR-0004 fallback — T0.2 deferred Pi-Key): `createIdentity()`, `sign(obs, identity)`, `verify(obs)`, with a **self-certifying** `nodeId` (`pk:<base58>` of the public key, so receivers verify straight from the record — no key distribution). Signs the canonical bytes (record minus `sig`, deep key-sorted). `obsCell` is a **coarse geohash** (`coarseCell()`, ~±2.4 km) — raw coords can't reach the wire ([ADR-0007](./adrs/0007-contributor-privacy.md)). JSON Schema at [`docs/schemas/observation.schema.json`](./schemas/observation.schema.json), cross-checked against the code by a test. 17 cases in [`docs/test/observation.test.mjs`](./test/observation.test.mjs) cover round-trip, tamper rejection (every field + key-substitution + corrupted sig), `v`-version gating, hostile-input safety, deep canonicalization, and privacy. Verified green under `npm test` **and** in a real browser (in-browser WebCrypto Ed25519).
   - Goal: define the canonical unit every node gossips.
   - Do: `src/mesh/observation.js` — versioned schema (kind: aircraft|satellite|
     sensor; az/el/range; coarse cell, never raw home coords; timestamp; nodeId;
@@ -248,7 +248,7 @@ Pull into a phase when a dependency lands. Detail in [ADR-0001](./adrs/0001-fede
 1. Substrate specifics: edge-net P2P mesh **or** QuDAG DAG as the primary transport, and is `qudag-wasm` browser-ready today? (drives T0.2) — _**browser-readiness answered by the T0.2 spike: no** (qudag-wasm is crypto-only on wasm; edge-net needs a signaling server) → Phase 1 ships on the simulator. The edge-net-vs-QuDAG **direction** is still ruvnet's to confirm. See [ADR-0002 App. A](./adrs/0002-networking-substrate-qudag-synaptic-mesh.md#appendix-a--t02-spike-report-browser-transport)._
 2. Is **rUv** a real credit/token here or just a contribution metric? (drives [ADR-0008](./adrs/0008-trust-and-incentives.md))
 3. Data licensing + privacy stance for shared tracks. (drives [ADR-0007](./adrs/0007-contributor-privacy.md))
-4. Identity: adopt **Pi-Key** as specified, or Ed25519/WebCrypto for v1? (drives [ADR-0004](./adrs/0004-signed-observation-and-identity.md))
+4. Identity: adopt **Pi-Key** as specified, or Ed25519/WebCrypto for v1? (drives [ADR-0004](./adrs/0004-signed-observation-and-identity.md)) — _**v1 ships Ed25519/WebCrypto** (T0.3), the ADR-0004 fallback, since T0.2 deferred Pi-Key with the QuDAG transport ([ADR-0002 App. A](./adrs/0002-networking-substrate-qudag-synaptic-mesh.md#appendix-a--t02-spike-report-browser-transport)). Whether to adopt Pi-Key when that transport lands is still ruvnet's to confirm._
 
 ## Glossary
 
