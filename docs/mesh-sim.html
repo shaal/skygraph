@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EdgeNet mesh-sim</title>
+  <!-- T1.2 — BroadcastChannel multi-tab mesh simulator. A dev/test harness, not
+       part of the deployed app; it imports the mesh from ../src/mesh/, so run it
+       under `npm run dev`. See docs/EDGENET.md (T1.2) and docs/DEV.md. -->
+  <style>
+    :root {
+      --bg: #07090f; --panel: #0d1220; --edge: #1b2440;
+      --ink: #c7d2e8; --dim: #6b7896; --accent: #5aa9ff; --warn: #ff9f43;
+      --ok: #4ade80; --sat: #c08cff;
+    }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      background: radial-gradient(ellipse at 50% -20%, #101a33 0%, var(--bg) 60%);
+      color: var(--ink);
+      font: 13px/1.5 "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+      padding: 18px; box-sizing: border-box;
+    }
+    h1 { font-size: 16px; margin: 0 0 2px; color: #e8eefc; font-weight: 600; }
+    .sub { color: var(--dim); font-size: 11.5px; margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; max-width: 980px; }
+    .panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 12px 14px; }
+    .panel h2 { font-size: 12px; margin: 0 0 8px; color: #e8eefc; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+    dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0; }
+    dt { color: var(--dim); }
+    dd { margin: 0; color: var(--ink); }
+    .badge { display: inline-block; padding: 1px 8px; border-radius: 5px; font-size: 11px; border: 1px solid var(--edge); }
+    .badge.sim { background: #11321f; color: var(--ok); border-color: #1d5436; }
+    .badge.real { background: #2a1f0c; color: var(--warn); border-color: #5a3f1d; }
+    .big { font-size: 22px; color: #e8eefc; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+    button {
+      background: #16203c; color: var(--ink); border: 1px solid var(--edge);
+      border-radius: 6px; padding: 4px 12px; font: inherit; cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); color: #e8eefc; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { text-align: left; color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--edge); padding: 3px 6px; }
+    td { padding: 3px 6px; border-bottom: 1px solid #131a2e; }
+    td.num, td.cell { text-align: right; color: var(--dim); }
+    td.who { color: var(--accent); }
+    .kind-aircraft { color: var(--ink); }
+    .kind-satellite { color: var(--sat); }
+    .kind-sensor { color: var(--warn); }
+    .muted { color: var(--dim); }
+    #stats { color: var(--dim); font-size: 11.5px; margin-top: 8px; }
+    #log { background: #060912; border: 1px solid var(--edge); border-radius: 6px; padding: 8px;
+           height: 130px; overflow: auto; white-space: pre-wrap; color: var(--dim); font-size: 11px; margin: 0; }
+    .full { grid-column: 1 / -1; }
+    .fatal { background: #2a0e0e; border: 1px solid #5a1d1d; color: #ffb3b3; padding: 10px 14px; border-radius: 8px; max-width: 980px; }
+    code { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <h1>EdgeNet mesh-sim <span id="kind" class="badge">…</span></h1>
+  <div class="sub">
+    Each tab is a node. Open this page in 2–3 tabs (same URL) and watch them
+    exchange signed Observations over the BroadcastChannel mesh. Selector:
+    <code>?real</code> uses the QuDAG loopback instead; <code>?topic=</code>,
+    <code>?bus=</code>, <code>?rate=</code>, <code>?name=</code> also work.
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>This node</h2>
+      <dl>
+        <dt>id</dt><dd id="nodeid">…</dd>
+        <dt>topic</dt><dd id="topic">…</dd>
+        <dt>bus</dt><dd id="bus">…</dd>
+        <dt>cell</dt><dd id="cell">…</dd>
+        <dt>location</dt><dd id="loc">…</dd>
+        <dt>published</dt><dd id="published">0</dd>
+      </dl>
+      <div class="controls">
+        <button id="toggle">Pause publishing</button>
+        <button id="pub-one">Publish one</button>
+        <button id="leave">Leave (go offline)</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Peers</h2>
+      <div class="big"><span id="peers">0</span> online</div>
+      <dl><dt>ids</dt><dd id="peer-ids">—</dd></dl>
+      <div id="stats">—</div>
+    </div>
+
+    <div class="panel full">
+      <h2>Observations received from peers</h2>
+      <table>
+        <thead>
+          <tr><th>from</th><th>kind</th><th>target</th><th>az</th><th>el</th><th>cell</th></tr>
+        </thead>
+        <tbody id="recv-body"></tbody>
+      </table>
+    </div>
+
+    <div class="panel full">
+      <h2>Log</h2>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+  <script type="module" src="./mesh-sim.js"></script>
+</body>
+</html>

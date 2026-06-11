@@ -55,6 +55,23 @@ How the pieces map under Vite (see [`vite.config.js`](../vite.config.js)):
   npm packages anyway, per ADR-0003). Their node-tests live in `docs/test/` so
   `npm test` picks them up.
 
+### Mesh simulator (T1.2)
+
+`docs/mesh-sim.html` is a multi-tab mesh harness: each open tab is one node with
+its own identity and a jittered location, exchanging signed Observations over the
+`BroadcastChannelTransport`. Run it under Vite (it imports `../src/mesh/`, so the
+no-build path #1 can't serve it):
+
+```bash
+npm run dev
+# open http://localhost:5173/mesh-sim.html in 2–3 tabs (same URL) — each tab
+# shows the others as peers and a live stream of their Observations.
+```
+
+Flags: `?real` swaps in the QuDAG loopback (one tab only, for contrast),
+`?topic=`, `?bus=`, `?rate=` (ms between publishes), `?name=` (tab label). It's a
+dev/test tool — not a build entry, so it isn't bundled into `./dist`.
+
 ## Deploy
 
 - **Today:** Pages serves `docs/` from `main` directly. Nothing to build.

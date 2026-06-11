@@ -41,6 +41,13 @@ export const DEFAULT_MAX_AGE_S = 120;
 // or a forged-forward replay and drop it. Small, since legitimate skew is small.
 export const DEFAULT_CLOCK_SKEW_S = 10;
 
+// Presence (peer-discovery) cadence for the BroadcastChannel simulator. A node
+// announces itself on join and re-announces every heartbeat; a peer not heard
+// from within the TTL is presumed gone. The TTL is a few missed beats so one
+// dropped heartbeat doesn't flap the peer count (T1.4's "N nodes online").
+export const DEFAULT_HEARTBEAT_MS = 5_000;
+export const DEFAULT_PEER_TTL_MS = 15_000;
+
 const te = new TextEncoder();
 const td = new TextDecoder();
 
@@ -215,4 +222,159 @@ export class QudagTransport extends MeshTransport {
 // to isolate tests from one another.
 export function _resetBuses() {
   _buses.clear();
+}
+
+// ── BroadcastChannelTransport — the multi-tab simulator (T1.2) ───────────────
+// The same MeshTransport contract, wired over the browser `BroadcastChannel`
+// API so several browser tabs (or several instances in one process) form a real
+// mesh with no server and no real peers — a node per tab, each with its own
+// identity and jittered location. This is how Phase 1 is demonstrated and
+// solo-tested while the real QuDAG browser wire stays deferred (ADR-0002).
+//
+// Why two channels. `BroadcastChannel` gives a name-keyed broadcast bus and,
+// usefully, never echoes a message back to the instance that sent it — exactly
+// Gossipsub's "don't deliver to the publisher" rule, for free. But it offers no
+// peer discovery. So the wire is split: an *observation* channel that carries
+// the very same UTF-8-JSON bytes `QudagTransport` puts on its bus (so the
+// receipt gate in the base class is byte-for-byte identical), and a *presence*
+// channel that carries tiny hello/beat/bye control frames used only to maintain
+// `peers()`. The presence plane is cosmetic (it drives the peer/coverage
+// readout, T1.4); the *trust* boundary is still the observation receipt gate,
+// which re-verifies every record regardless of what presence claims.
+//
+// `now` and `heartbeatMs` are injectable so peer liveness is testable on a fake
+// clock with no real timers (`heartbeatMs: 0` disables the auto-heartbeat).
+export class BroadcastChannelTransport extends MeshTransport {
+  constructor({
+    nodeId,
+    busId = "skygraph",
+    heartbeatMs = DEFAULT_HEARTBEAT_MS,
+    peerTtlMs = DEFAULT_PEER_TTL_MS,
+    now = () => Date.now(),
+    ...opts
+  } = {}) {
+    super({ nodeId, ...opts });
+    if (typeof BroadcastChannel === "undefined") {
+      throw new Error("BroadcastChannelTransport requires the BroadcastChannel API (a browser tab or Node ≥18)");
+    }
+    this.busId = busId;
+    this.heartbeatMs = heartbeatMs;
+    this.peerTtlMs = peerTtlMs;
+    this._now = now;
+    this._joined = false;
+    this._obsChan = null;
+    this._presenceChan = null;
+    this._peers = new Map(); // peer nodeId -> last-seen (ms, from this._now)
+    this._beat = null;       // heartbeat interval handle
+  }
+
+  // Channel names are namespaced by bus + topic so unrelated meshes (and the
+  // observation vs presence planes) never cross. Same bus + same topic = one mesh.
+  _chanName(plane) {
+    return `skygraph:${this.busId}:${this.topic}:${plane}`;
+  }
+
+  // Subscribe to `topic`: open the observation + presence channels, announce
+  // ourselves, and start heartbeating. Re-joining first leaves cleanly so the
+  // old channels and timer are released.
+  join(topic) {
+    if (typeof topic !== "string" || topic.length === 0) {
+      throw new TypeError("join(topic) requires a non-empty topic string");
+    }
+    if (this._joined) this.leave();
+    this.topic = topic;
+    this._obsChan = new BroadcastChannel(this._chanName("obs"));
+    this._presenceChan = new BroadcastChannel(this._chanName("presence"));
+    // Inbound observations go straight through the shared receipt gate.
+    this._obsChan.onmessage = (e) => { this._ingest(e.data); };
+    this._presenceChan.onmessage = (e) => this._onPresence(e.data);
+    this._joined = true;
+
+    this._announce("hello");
+    if (this.heartbeatMs > 0) {
+      this._beat = setInterval(() => this._announce("beat"), this.heartbeatMs);
+      this._beat?.unref?.(); // never keep a Node process (or test) alive on our account
+    }
+    return this;
+  }
+
+  _announce(t) {
+    this._presenceChan?.postMessage({ t, id: this.nodeId });
+  }
+
+  // Maintain the peer set from presence frames. `hello` from a newcomer also
+  // earns an immediate `beat` reply so discovery is mutual without waiting a
+  // full heartbeat — late joiners and incumbents learn each other at once.
+  // Guards keep junk (or a node's own echo, though BroadcastChannel won't send
+  // one) from polluting the count; this is cosmetic, not the trust boundary.
+  _onPresence(msg) {
+    if (!msg || typeof msg.id !== "string" || !msg.id.startsWith("pk:")) return;
+    if (msg.id === this.nodeId) return;
+    if (msg.t === "bye") { this._peers.delete(msg.id); return; }
+    const known = this._peers.has(msg.id);
+    this._peers.set(msg.id, this._now());
+    if (msg.t === "hello" && this._joined) this._announce("beat");
+    return known; // (return value is for tests/introspection only)
+  }
+
+  // Broadcast a signed Observation to every same-channel peer. BroadcastChannel
+  // does not echo to the sender, so — like Gossipsub — we never receive our own.
+  // Returns the number of bytes put on the wire.
+  async publish(obs) {
+    if (!this._joined) throw new Error("publish before join(topic)");
+    const bytes = this._encode(obs);
+    this._obsChan.postMessage(bytes);
+    return bytes.length;
+  }
+
+  // nodeIds currently believed live on this topic, excluding self. Peers past
+  // the TTL are pruned here (lazily, on read) so a tab that closed without a
+  // clean `leave()` still ages out of everyone's count.
+  peers() {
+    const cutoff = this._now() - this.peerTtlMs;
+    for (const [id, seen] of this._peers) {
+      if (seen < cutoff) this._peers.delete(id);
+    }
+    return [...this._peers.keys()];
+  }
+
+  // Leave the topic: tell peers we're going, stop heartbeating, close channels.
+  // Idempotent. Models a tab closing so peer counts react to churn.
+  leave() {
+    if (!this._joined) return;
+    this._announce("bye");
+    if (this._beat) { clearInterval(this._beat); this._beat = null; }
+    this._obsChan?.close();
+    this._presenceChan?.close();
+    this._obsChan = null;
+    this._presenceChan = null;
+    this._peers.clear();
+    this._joined = false;
+    this.topic = null;
+  }
+}
+
+// ── transport selection — real (QuDAG) vs sim (BroadcastChannel) ─────────────
+// The single seam the app flips to choose a wire (acceptance: "selectable real
+// vs sim via config/flag"). `kind: "sim"` is the multi-tab BroadcastChannel
+// simulator; the default is the QuDAG-shaped transport (today its in-process
+// loopback, tomorrow the real wire — same class, T0.2). Every other option is
+// passed straight through to the chosen transport's constructor.
+export function createTransport({ kind = "qudag", ...opts } = {}) {
+  switch (kind) {
+    case "sim":
+    case "broadcast":
+      return new BroadcastChannelTransport(opts);
+    case "qudag":
+    case "real":
+      return new QudagTransport(opts);
+    default:
+      throw new TypeError(`createTransport: unknown kind ${JSON.stringify(kind)} (expected "sim" or "qudag")`);
+  }
+}
+
+// Map a URLSearchParams (or anything with `.has`) to a transport kind, so a page
+// can offer the sim behind `?sim`. Present (even `?sim` / `?sim=1`) ⇒ simulator.
+export function transportKindFromParams(params) {
+  return params && typeof params.has === "function" && params.has("sim") ? "sim" : "qudag";
 }

@@ -10,7 +10,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  MeshTransport, QudagTransport,
+  MeshTransport, QudagTransport, BroadcastChannelTransport,
+  createTransport, transportKindFromParams,
   DEFAULT_MAX_AGE_S,
 } from "../../src/mesh/transport.js";
 import { createIdentity, sign, coarseCell } from "../../src/mesh/observation.js";
@@ -273,4 +274,256 @@ test("publish refuses unjoined transports and invalid Observations", async () =>
   const obs = await signedObs(idA);
   assert.throws(() => a._encode({ ...obs, az: 999 }), /invalid observation/);
   assert.throws(() => a._encode({ ...obs, sig: undefined }), /invalid observation/);
+});
+
+// ── BroadcastChannelTransport — the multi-tab simulator (T1.2) ───────────────
+// Node's BroadcastChannel connects same-process instances exactly as browser
+// tabs connect, and (like the spec) never echoes to the sender — so two
+// transports here model two tabs. Delivery is async, so we let the event loop
+// turn before asserting; `flush` waits a macrotask, `waitFor` polls a predicate.
+const flush = () => new Promise((r) => setTimeout(r, 25));
+async function waitFor(pred, tries = 40) {
+  for (let i = 0; i < tries; i++) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return pred();
+}
+// A controllable clock so peer liveness is testable without real timers.
+function fakeClock(t = 0) {
+  const c = { t, now: () => c.t, advance: (ms) => { c.t += ms; } };
+  return c;
+}
+// heartbeatMs:0 keeps background timers out of tests; the fake clock drives TTL.
+function simNode(nodeId, busId, extra = {}) {
+  return new BroadcastChannelTransport({ nodeId, busId, heartbeatMs: 0, ...extra });
+}
+
+test("createTransport selects sim vs real; transportKindFromParams reads ?sim", () => {
+  assert.ok(createTransport({ kind: "sim", nodeId: "pk:abc" }) instanceof BroadcastChannelTransport);
+  assert.ok(createTransport({ kind: "qudag", nodeId: "pk:abc" }) instanceof QudagTransport);
+  assert.ok(createTransport({ nodeId: "pk:abc" }) instanceof QudagTransport, "default is the real (QuDAG) transport");
+  assert.throws(() => createTransport({ kind: "carrier-pigeon", nodeId: "pk:abc" }), /unknown kind/);
+
+  assert.equal(transportKindFromParams(new URLSearchParams("?sim")), "sim");
+  assert.equal(transportKindFromParams(new URLSearchParams("?sim=1")), "sim");
+  assert.equal(transportKindFromParams(new URLSearchParams("")), "qudag");
+  assert.equal(transportKindFromParams(undefined), "qudag");
+});
+
+test("sim: a signed Observation crosses the BroadcastChannel to a same-topic peer", async () => {
+  const busId = newBus();
+  const idA = await createIdentity();
+  const a = simNode(idA.nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  try {
+    a.join("sky"); b.join("sky");
+    const got = [];
+    b.onObservation((o) => got.push(o));
+
+    const obs = await signedObs(idA);
+    const bytes = await a.publish(obs);
+    assert.ok(bytes > 0, "publish reports bytes on the wire");
+
+    await waitFor(() => got.length === 1);
+    assert.equal(got.length, 1, "peer received exactly one Observation");
+    assert.deepEqual(got[0], obs, "record is identical after the BroadcastChannel round-trip");
+    assert.equal(b.stats.delivered, 1);
+    assert.equal(b.stats.droppedInvalidSig, 0);
+  } finally { a.leave(); b.leave(); }
+});
+
+test("sim: one publish fans out to every same-topic peer, and not off-topic ones", async () => {
+  const busId = newBus();
+  const idA = await createIdentity();
+  const a = simNode(idA.nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  const c = simNode((await createIdentity()).nodeId, busId);
+  const d = simNode((await createIdentity()).nodeId, busId);
+  try {
+    a.join("sky"); b.join("sky"); c.join("sky"); d.join("weather"); // d elsewhere
+    const gotB = [], gotC = [], gotD = [];
+    b.onObservation((o) => gotB.push(o));
+    c.onObservation((o) => gotC.push(o));
+    d.onObservation((o) => gotD.push(o));
+
+    const obs = await signedObs(idA);
+    await a.publish(obs);
+
+    await waitFor(() => gotB.length === 1 && gotC.length === 1);
+    assert.deepEqual(gotB, [obs], "first same-topic peer received it");
+    assert.deepEqual(gotC, [obs], "second same-topic peer received it");
+    await flush();
+    assert.equal(gotD.length, 0, "off-topic peer received nothing");
+  } finally { a.leave(); b.leave(); c.leave(); d.leave(); }
+});
+
+test("sim: the publisher does not receive its own message (no self-echo)", async () => {
+  const busId = newBus();
+  const idA = await createIdentity();
+  const a = simNode(idA.nodeId, busId);
+  try {
+    a.join("sky");
+    const mine = [];
+    a.onObservation((o) => mine.push(o));
+    await a.publish(await signedObs(idA));
+    await flush();
+    assert.equal(mine.length, 0, "own publish is not echoed back");
+  } finally { a.leave(); }
+});
+
+test("sim: the receipt gate still drops a tampered record over the BroadcastChannel", async () => {
+  const busId = newBus();
+  const idA = await createIdentity();
+  const a = simNode(idA.nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  try {
+    a.join("sky"); b.join("sky");
+    const got = [];
+    b.onObservation((o) => got.push(o));
+
+    const obs = await signedObs(idA);
+    await a.publish({ ...obs, az: 200 }); // structurally valid, signature no longer matches
+    await flush();
+
+    assert.equal(got.length, 0, "forged record never reaches a subscriber");
+    assert.equal(b.stats.droppedInvalidSig, 1);
+    assert.equal(b.stats.delivered, 0);
+  } finally { a.leave(); b.leave(); }
+});
+
+test("sim: buses and topics are isolated", async () => {
+  const idA = await createIdentity();
+  const a = simNode(idA.nodeId, newBus());
+  const farBus = simNode((await createIdentity()).nodeId, newBus());
+  const offTopic = simNode((await createIdentity()).nodeId, a.busId);
+  try {
+    a.join("sky"); farBus.join("sky"); offTopic.join("weather");
+    const gotFar = [], gotOff = [];
+    farBus.onObservation((o) => gotFar.push(o));
+    offTopic.onObservation((o) => gotOff.push(o));
+
+    await a.publish(await signedObs(idA));
+    await flush();
+    assert.equal(gotFar.length, 0, "same topic, different bus → not connected");
+    assert.equal(gotOff.length, 0, "same bus, different topic → not connected");
+  } finally { a.leave(); farBus.leave(); offTopic.leave(); }
+});
+
+test("sim: peers() discovers same-topic nodes mutually and excludes self", async () => {
+  const busId = newBus();
+  const a = simNode((await createIdentity()).nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  const c = simNode((await createIdentity()).nodeId, busId);
+  try {
+    a.join("sky"); b.join("sky"); c.join("other"); // c on a different topic
+
+    await waitFor(() => a.peers().length === 1 && b.peers().length === 1);
+    assert.deepEqual(a.peers().sort(), [b.nodeId], "a sees only the same-topic peer, never itself");
+    assert.deepEqual(b.peers().sort(), [a.nodeId]);
+    assert.deepEqual(c.peers(), [], "node on another topic has no peers here");
+  } finally { a.leave(); b.leave(); c.leave(); }
+});
+
+test("sim: a third tab joining is discovered by the incumbents (mutual hello)", async () => {
+  const busId = newBus();
+  const a = simNode((await createIdentity()).nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  try {
+    a.join("sky"); b.join("sky");
+    await waitFor(() => a.peers().length === 1);
+
+    const c = simNode((await createIdentity()).nodeId, busId);
+    try {
+      c.join("sky"); // late joiner
+      await waitFor(() => a.peers().length === 2 && b.peers().length === 2 && c.peers().length === 2);
+      assert.equal(a.peers().length, 2, "incumbent A discovered the newcomer");
+      assert.equal(b.peers().length, 2, "incumbent B discovered the newcomer");
+      assert.deepEqual(c.peers().sort(), [a.nodeId, b.nodeId].sort(), "newcomer discovered both incumbents");
+    } finally { c.leave(); }
+
+    await waitFor(() => a.peers().length === 1);
+    assert.equal(a.peers().length, 1, "leave() drops the departed tab from the peer count");
+  } finally { a.leave(); b.leave(); }
+});
+
+test("sim: heartbeats keep a live peer from ageing out past the TTL", async () => {
+  // Real timers + real clock, tiny cadence so it's fast. If the heartbeat were
+  // broken, both peers would age out after one TTL and — with no fresh hello —
+  // never come back; a multi-tab session would silently empty after ~15 s.
+  const busId = newBus();
+  const a = new BroadcastChannelTransport({ nodeId: (await createIdentity()).nodeId, busId, heartbeatMs: 20, peerTtlMs: 80 });
+  const b = new BroadcastChannelTransport({ nodeId: (await createIdentity()).nodeId, busId, heartbeatMs: 20, peerTtlMs: 80 });
+  try {
+    a.join("sky"); b.join("sky");
+    assert.ok(await waitFor(() => a.peers().length === 1 && b.peers().length === 1), "discovered");
+    await new Promise((r) => setTimeout(r, 300)); // > 3× TTL of continuous heartbeating
+    assert.equal(a.peers().length, 1, "heartbeat kept B present well past its TTL");
+    assert.equal(b.peers().length, 1, "heartbeat kept A present well past its TTL");
+  } finally { a.leave(); b.leave(); }
+});
+
+test("sim: junk presence frames never pollute the peer count", async () => {
+  const b = simNode((await createIdentity()).nodeId, newBus());
+  try {
+    b.join("sky");
+    b._onPresence(null);
+    b._onPresence({ t: "hello" });            // no id
+    b._onPresence({ t: "hello", id: 42 });    // non-string id
+    b._onPresence({ t: "hello", id: "nope" }); // not a pk: nodeId
+    b._onPresence({ t: "hello", id: b.nodeId }); // our own id is ignored
+    assert.deepEqual(b.peers(), [], "no garbage (or self) entered the peer set");
+  } finally { b.leave(); }
+});
+
+test("sim: a silent peer ages out after the TTL (injected clock)", async () => {
+  const busId = newBus();
+  const clock = fakeClock(1_000);
+  const a = simNode((await createIdentity()).nodeId, busId, { now: clock.now, peerTtlMs: 15_000 });
+  const b = simNode((await createIdentity()).nodeId, busId, { now: clock.now, peerTtlMs: 15_000 });
+  try {
+    a.join("sky"); b.join("sky");
+    await waitFor(() => a.peers().length === 1);
+    assert.equal(a.peers().length, 1, "discovered while fresh");
+
+    clock.advance(15_001); // b goes silent past the TTL — no heartbeat (heartbeatMs:0)
+    assert.deepEqual(a.peers(), [], "a silent peer is pruned once past the TTL");
+  } finally { a.leave(); b.leave(); }
+});
+
+test("sim: a node can leave and rejoin, and is re-discovered", async () => {
+  const busId = newBus();
+  const a = simNode((await createIdentity()).nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  try {
+    a.join("sky"); b.join("sky");
+    assert.ok(await waitFor(() => a.peers().length === 1), "discovered first");
+
+    b.leave(); // b goes offline — its bye drops it from a's count
+    assert.ok(await waitFor(() => a.peers().length === 0), "a sees b leave");
+
+    b.join("sky"); // and comes back on the same topic
+    assert.ok(await waitFor(() => a.peers().length === 1 && b.peers().length === 1), "rediscovered after rejoin");
+    assert.deepEqual(a.peers(), [b.nodeId]);
+    assert.deepEqual(b.peers(), [a.nodeId]);
+  } finally { a.leave(); b.leave(); }
+});
+
+test("sim: publish before join rejects; unsubscribe stops delivery", async () => {
+  const busId = newBus();
+  const idA = await createIdentity();
+  const a = simNode(idA.nodeId, busId);
+  const b = simNode((await createIdentity()).nodeId, busId);
+  try {
+    const early = await signedObs(idA);
+    await assert.rejects(() => a.publish(early), /before join/);
+
+    a.join("sky"); b.join("sky");
+    const got = [];
+    const off = b.onObservation((o) => got.push(o));
+    off();
+    await a.publish(await signedObs(idA));
+    await flush();
+    assert.equal(got.length, 0, "unsubscribed callback no longer fires");
+  } finally { a.leave(); b.leave(); }
 });
