@@ -24,7 +24,7 @@ import { canonicalizeTracks } from "../src/mesh/fusion.js";
 import { buildCoverage } from "../src/mesh/coverage.js";
 import { ProvenanceDag } from "../src/mesh/dag.js";
 import { SharedNoveltyMemory } from "../src/mesh/shared-novelty.js";
-import { AnomalyConsensus } from "../src/mesh/consensus.js";
+import { AnomalyConsensus, anomalyVoteKind } from "../src/mesh/consensus.js";
 import { FederatedAnomalyModel } from "../src/mesh/fedmodel.js";
 import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
 import { ReputationLedger } from "../src/mesh/reputation.js";
@@ -32,6 +32,7 @@ import { ContributionLedger } from "../src/mesh/ruv.js";
 import { SlashingLedger } from "../src/mesh/slashing.js";
 import { createSensorRegistry, SENSOR_KIND } from "../src/mesh/sensors.js";
 import { createWatcherRegistry, createBurstWatcher } from "../src/mesh/watchers.js";
+import { createSubscriptionRegistry } from "../src/mesh/subscriptions.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -144,6 +145,15 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // case one node first-sees everything, so the cross-node gate keeps it silent.
   const watchers = createWatcherRegistry();
   watchers.register(createBurstWatcher());
+  // Region subscriptions (T5.3, ADR-0001): a local registry of bounding boxes this
+  // node watches. `regionAlerts` joins the network's CONFIRMED anomalies (T3.2) with
+  // the coarse cells (T1.3/ADR-0007) of the nodes corroborating them and fires when a
+  // corroborating cell falls inside a subscribed box — so this node can be alerted to
+  // an anomaly in an airspace its OWN receiver can't reach (the spec's "even when your
+  // node can't"). A subscription is purely LOCAL — never an Observation field — so it
+  // adds nothing to the wire (ADR-0007); the alert is driven entirely by remote peers'
+  // already-gossiped looks. Empty by default → the real app is unchanged.
+  const subscriptions = createSubscriptionRegistry();
   // The time span (seconds) of a track's POSITIONED sources — the ones reputation
   // scores (those in `residuals`). Used to gate reputation on a co-temporal fuse
   // (see REP_CO_TEMPORAL_WINDOW_S). Infinity when the store has no such track.
@@ -158,6 +168,34 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
       if (o.t > maxT) maxT = o.t;
     }
     return maxT < minT ? Infinity : maxT - minT;
+  }
+  // Build the region-subscription scan input (T5.3): the network's CONFIRMED anomalies
+  // (T3.2), each paired with the coarse cells + nodeIds of the peers corroborating it
+  // (from the network store). The store holds PEERS' looks only (never our own
+  // first-person feed), so an anomaly here is inherently network-driven — the basis of
+  // "even when your node can't". Shared by `regionAlerts` and `regionAlertCount`.
+  function confirmedAnomalySignals(nowT) {
+    const anomalies = [];
+    for (const tr of store.tracks()) {
+      const verdict = consensus.status(tr.target, { nowT });
+      if (!verdict || !verdict.confirmed) continue; // only network-corroborated anomalies
+      // Localize with the cells of the nodes actually FLAGGING this anomaly's KIND, not
+      // every observer — so a region fires because a node THERE corroborated THIS anomaly,
+      // not merely because a far-off receiver can also see the target, nor because a node
+      // flagged a DIFFERENT kind (e.g. "jam") on the same target. `anomalyVoteKind` parses
+      // each look's vote exactly as consensus does, so the attached evidence matches the
+      // verdict's kind. A confirmed anomaly whose current looks have all dropped the flag
+      // (a decaying alert) yields no cells and doesn't fire — we can no longer say WHERE it
+      // is being corroborated.
+      const reporters = [];
+      for (const o of tr.observations()) {
+        if (anomalyVoteKind(o && o.payload ? o.payload.anomaly : undefined) === verdict.kind) {
+          reporters.push({ nodeId: o.nodeId, cell: o.obsCell, t: o.t });
+        }
+      }
+      anomalies.push({ target: tr.target, kind: verdict.kind, voters: verdict.voters, confirmed: true, reporters });
+    }
+    return anomalies;
   }
   function recordRf(obs) {
     // Like recordVote/recordGradient: `ingest` is written not to throw, but this step
@@ -418,6 +456,31 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     },
     // Watcher registry roll-up for diagnostics/tests.
     watcherStats: () => ({ watchers: watchers.size, ...watchers.stats }),
+    // Region subscriptions (T5.3): watch a bounding box. `subscribeRegion(bbox)` (bbox =
+    // { minLat, minLon, maxLat, maxLon }; throws on a malformed box) registers it and
+    // returns an id; `unsubscribeRegion(id)` removes it. Purely local — nothing rides the
+    // wire. `?subscribe=` in sky.js / the detail UI drive these.
+    subscribeRegion: (bbox, opts) => subscriptions.subscribe(bbox, opts),
+    unsubscribeRegion: (id) => subscriptions.unsubscribe(id),
+    // The boxes this node currently watches, each { id, bbox, label } — for the UI.
+    regionSubscriptions: () => subscriptions.subscriptions(),
+    // The live region alerts (T5.3): for every subscribed box, the network's CONFIRMED
+    // anomalies (T3.2) whose corroborating nodes' coarse cells fall inside it. Each alert
+    // carries its EVIDENCE — the target, the anomaly kind, the corroboration count, and the
+    // contributing nodes/cells. Built by joining the network store (peers' looks — never our
+    // own first-person feed, so an alert is inherently "driven by remote nodes") with the
+    // consensus verdict; the subscription registry does the pure region/freshness/bounds
+    // match. Empty until a confirmed anomaly lands in a watched box, so the readout segment
+    // stays hidden. `nowT` drives freshness; defaults to wall-clock.
+    regionAlerts: ({ nowT = Math.floor(Date.now() / 1000) } = {}) =>
+      subscriptions.scan({ nowT, anomalies: confirmedAnomalySignals(nowT) }).alerts,
+    // How many region alerts are currently live across all subscribed boxes — the headline
+    // "▣ N region" count for the network-sky readout. 0 (segment hidden) until a confirmed
+    // anomaly lands in a watched box.
+    regionAlertCount: (nowT = Math.floor(Date.now() / 1000)) =>
+      subscriptions.scan({ nowT, anomalies: confirmedAnomalySignals(nowT) }).alerts.length,
+    // Subscription registry roll-up for diagnostics/tests.
+    subscriptionStats: () => subscriptions.stats(),
     // Anomaly consensus (T3.2): the corroboration verdict for one target — null if
     // no node has flagged it, else { confirmed, voters, k, kind, maxScore }. `nowT`
     // drives vote freshness; defaults to wall-clock so a caller can omit it.

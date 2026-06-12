@@ -91,6 +91,16 @@ const SENSOR = params.get("sensor") || "";
 // first-seen by its own node (the cross-node gate). E.g.:
 //   ?bus=skygraph-edgenet&topic=all-sky&burst=4   (in two tabs)
 const BURST = params.has("burst") ? Math.max(0, Math.floor(Number(params.get("burst")) || 0)) : 0;
+// T5.3 region-subscription injection. `?anomaly=<kind>` makes every publish carry a
+// `payload.anomaly` vote (the T3.2 channel), so two tabs reporting the SAME target
+// (pin `?target=`) CONFIRM an anomaly the app can alert a region subscriber on. Each
+// tab's coarse cell is its own jittered location near the shared BASE point (Oakville,
+// ON), so subscribe the app to a box around BASE to light its "▣ N region" readout:
+//   sim A:  ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&anomaly=spoof
+//   sim B:  ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&anomaly=spoof
+//   app:    ?subscribe=43,-80.2,43.9,-79.2   (a box around BASE, which the two tabs sit in)
+// The app then confirms GHOST1 anomalous (2 distinct nodes) and fires a region alert.
+const ANOMALY = params.get("anomaly") || "";
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -153,6 +163,11 @@ async function makeObservation(burstTarget) {
   // corroborates a blocklist. Carries only the accused nodeId + a reason (no location).
   if (SLASH_TARGET) {
     draft.payload = { ...(draft.payload || {}), slash: { node: SLASH_TARGET, reason: SLASH_REASON } };
+  }
+  // T5.3: attach a §15-style anomaly vote so two tabs on the same target confirm it,
+  // letting the app fire a region-subscription alert for the box this node sits in.
+  if (ANOMALY) {
+    draft.payload = { ...(draft.payload || {}), anomaly: ANOMALY };
   }
   return sign(draft, identity);
 }

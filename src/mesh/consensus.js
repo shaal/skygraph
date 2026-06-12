@@ -85,6 +85,22 @@ function normKind(kind) {
   return typeof kind === "string" && kind.length > 0 ? kind.slice(0, MAX_KIND_LEN) : DEFAULT_KIND;
 }
 
+// The normalised anomaly kind a `payload.anomaly` value votes for, or null if the
+// value is not a vote shape (missing/false/"", or a number/array). The single source
+// of truth for "what kind did this node flag", shared by `ingest` (which counts the
+// vote) and any caller that must ATTRIBUTE a vote to its kind — e.g. region
+// subscriptions (T5.3), which match an anomaly's CORROBORATING nodes' cells to a box
+// and so must only attach reporters who flagged THIS anomaly's kind, not some other
+// kind on the same target. Mirrors `ingest`'s accepted shapes exactly:
+//   "spoof" → "spoof"   ·   true → "anomaly"   ·   { kind } → that kind (or default)
+export function anomalyVoteKind(a) {
+  if (!a) return null;                                   // missing / false / "" / 0 — not a vote
+  if (typeof a === "string") return normKind(a);
+  if (a === true) return DEFAULT_KIND;
+  if (typeof a === "object" && !Array.isArray(a)) return typeof a.kind === "string" ? normKind(a.kind) : DEFAULT_KIND;
+  return null;                                           // a number, an array — not a vote
+}
+
 export class AnomalyConsensus {
   constructor({ k = DEFAULT_K, ttlSeconds = DEFAULT_TTL_S, maxAnomalies = DEFAULT_MAX_ANOMALIES, maxVoters = DEFAULT_MAX_VOTERS } = {}) {
     if (!Number.isInteger(k) || k < 1) throw new RangeError("AnomalyConsensus: k must be an integer >= 1");
@@ -128,19 +144,13 @@ export class AnomalyConsensus {
     try {
       const a = obs && obs.payload ? obs.payload.anomaly : undefined;
       if (!a) return false; // no vote on this observation (the common case)
-      let kind;
-      let score = null;
-      if (typeof a === "string") {
-        kind = a;
-      } else if (a === true) {
-        kind = DEFAULT_KIND;
-      } else if (typeof a === "object" && !Array.isArray(a)) {
-        kind = typeof a.kind === "string" ? a.kind : DEFAULT_KIND;
-        if (typeof a.score === "number" && Number.isFinite(a.score)) score = a.score;
-      } else {
+      const kind = anomalyVoteKind(a); // the one parser, shared with T5.3's attribution
+      if (kind === null) {
         this.stats.droppedMalformed++; // a number, an array, … — not a vote shape
         return false;
       }
+      // The §15 score is the only field `anomalyVoteKind` doesn't carry — read it here.
+      const score = typeof a === "object" && !Array.isArray(a) && typeof a.score === "number" && Number.isFinite(a.score) ? a.score : null;
       return this.record({ target: obs.target, kind, nodeId: obs.nodeId, t: obs.t, score });
     } catch {
       // The wire is JSON (the transport JSON-parses before delivery), so a real

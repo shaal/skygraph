@@ -182,6 +182,20 @@ async function main() {
         const target = new URLSearchParams(location.search).get("sensortarget") || undefined;
         mesh.sensors.register(createWifiCsiSensor({ modality: sensorParam, target }));
       }
+      // Region subscriptions (T5.3): `?subscribe=minLat,minLon,maxLat,maxLon` watches a
+      // bounding box — the readout's "▣ N region" lights when the network CONFIRMS an
+      // anomaly whose corroborating nodes' coarse cells fall inside it, even when this
+      // node has no eyes there. Off by default (no box ⇒ no alerts), so the app is
+      // unchanged; a malformed box is warned and ignored, never fatal.
+      const subscribeParam = new URLSearchParams(location.search).get("subscribe");
+      if (mesh && subscribeParam) {
+        try {
+          const [minLat, minLon, maxLat, maxLon] = subscribeParam.split(",").map(Number);
+          mesh.subscribeRegion({ minLat, minLon, maxLat, maxLon });
+        } catch (e) {
+          console.warn("[edgenet] ignoring malformed ?subscribe bbox:", e?.message || e);
+        }
+      }
     } catch (e) {
       console.warn("[edgenet] network sky unavailable:", e?.message || e);
     }
@@ -408,6 +422,11 @@ async function main() {
     // healthy/solo mesh — the cross-node gate keeps it silent unless ≥2 nodes
     // independently feed one surge — so the segment stays hidden by default.
     const swarm = mesh.swarmAlerts ? mesh.swarmAlerts().length : 0;
+    // Region subscriptions (T5.3): how many of this node's subscribed boxes currently hold
+    // a network-confirmed anomaly — an airspace alert driven by remote peers, even where
+    // this node has no eyes. 0 unless a box is subscribed (?subscribe=) AND a confirmed
+    // anomaly lands in it, so the segment stays hidden by default.
+    const regions = mesh.regionAlertCount ? mesh.regionAlertCount() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
@@ -420,6 +439,7 @@ async function main() {
       (distrusted ? ` · ⚑ ${distrusted} distrusted` : "") +
       (slashed ? ` · ⛔ ${slashed} slashed` : "") +
       (swarm ? ` · ⊛ ${swarm} swarm` : "") +
+      (regions ? ` · ▣ ${regions} region${regions === 1 ? "" : "s"}` : "") +
       (ruvNodes ? ` · ⊕ rUv ${ruvNodes}n` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }

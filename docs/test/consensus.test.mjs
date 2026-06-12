@@ -15,6 +15,7 @@ import {
   DEFAULT_K,
   DEFAULT_TTL_S,
   DEFAULT_KIND,
+  anomalyVoteKind,
 } from "../../src/mesh/consensus.js";
 import { startMeshLayer } from "../mesh-layer.js";
 import { _resetBuses } from "../../src/mesh/transport.js";
@@ -26,6 +27,29 @@ const vote = (target, nodeId, t, extra = {}) => ({ target, nodeId, t, ...extra }
 const obs = (target, nodeId, t, anomaly, extra = {}) => ({
   v: 1, kind: "aircraft", target, t, az: 90, el: 30, obsCell: "u4pru", nodeId, sig: "AAAA",
   payload: anomaly === undefined ? undefined : { anomaly }, ...extra,
+});
+
+// ---------------------------------------------------------------------------
+// anomalyVoteKind — the shared vote-shape parser (single source of truth for
+// ingest's counting AND T5.3 region-subscription attribution)
+// ---------------------------------------------------------------------------
+
+test("anomalyVoteKind mirrors ingest's accepted vote shapes", () => {
+  assert.equal(anomalyVoteKind("spoof"), "spoof");
+  assert.equal(anomalyVoteKind(true), DEFAULT_KIND);
+  assert.equal(anomalyVoteKind({ kind: "jam" }), "jam");
+  assert.equal(anomalyVoteKind({ kind: "jam", score: 0.9 }), "jam");
+  assert.equal(anomalyVoteKind({ score: 0.9 }), DEFAULT_KIND);       // object, no kind → default
+  assert.equal(anomalyVoteKind({ kind: 123 }), DEFAULT_KIND);        // non-string kind → default
+  assert.equal(anomalyVoteKind("x".repeat(50)), "x".repeat(32));     // clamped exactly like a stored verdict.kind
+  // Non-vote shapes → null (so they are neither counted nor attached as evidence).
+  for (const notAVote of [undefined, null, false, 0, "", 5, [], [1, 2]]) {
+    assert.equal(anomalyVoteKind(notAVote), null);
+  }
+  // The clamped kind round-trips: a vote of that kind reports the same (clamped) kind.
+  const c = new AnomalyConsensus({ k: 1 });
+  c.record({ target: "T", kind: "x".repeat(50), nodeId: "A", t: 1 });
+  assert.equal(c.status("T", { nowT: 1 }).kind, anomalyVoteKind("x".repeat(50)));
 });
 
 // ---------------------------------------------------------------------------
