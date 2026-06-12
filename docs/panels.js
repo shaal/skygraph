@@ -125,6 +125,15 @@ export function renderDetails(v) {
       ? `⚠ ${what} zone · corroborated by ${z.nodes} node${z.nodes === 1 ? "" : "s"} (mesh)`
       : `${esc(what)} suspected · ${z.nodes}/${z.k} nodes (mesh)`);
   }
+  // Node reputation (T4.1): when this target's network track is fused from a node the
+  // mesh distrusts (consistently disagreeing with consensus), say so and that its pull
+  // on the fused position is down-weighted. Absent ⇒ every contributor trusted / no
+  // mesh, so the line simply doesn't show.
+  if (tr.fusionTrust) {
+    const ft = tr.fusionTrust;
+    lines.push(`⚑ fused over ${ft.sources} node${ft.sources === 1 ? "" : "s"} · ` +
+      `${ft.distrusted} down-weighted (lowest trust ${Math.round(ft.minRep * 100)}%) (mesh)`);
+  }
   details.innerHTML = who +
     lines.map((l) => line(l, tr.emergency ? "#ff5252" : c)).join("");
 }

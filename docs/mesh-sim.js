@@ -50,6 +50,17 @@ const FIXED_EL = params.has("el") ? Number(params.get("el")) : null;
 // nodes) and its RF-integrity inset lights up. `?rfcell=` pins the affected coarse
 // cell (default: this node's own OBS_CELL, so co-located sim tabs hit one zone).
 const RF_KIND = params.get("rf") || "";
+// T4.1 reputation demo. `?spoof` makes this tab a MISBEHAVING node: it offsets its
+// published bearing by `?spoofdeg` (default 90°) off the pinned `?az`, so for a
+// target several honest tabs corroborate it sits grossly off the fused consensus —
+// the app's ReputationLedger then scores this node down and down-weights its pull on
+// the fused position. Run e.g. three tabs on the app's bus, two honest and one spoofer:
+//   ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&range=50000&az=30&el=20
+//   ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&range=50000&az=30&el=20  (2nd honest)
+//   ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&range=50000&az=30&el=20&spoof
+// and the app shows "⚑ 1 distrusted" with the spoofer's look pulled out of the fuse.
+const SPOOF = params.has("spoof");
+const SPOOF_DEG = params.has("spoofdeg") ? Number(params.get("spoofdeg")) : 90;
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -78,11 +89,15 @@ function logLine(msg) {
 // something to exchange.
 async function makeObservation() {
   const target = FIXED_TARGET || "SIM" + Math.floor(100 + Math.random() * 900);
+  let az = FIXED_AZ != null && Number.isFinite(FIXED_AZ) ? FIXED_AZ : +(Math.random() * 360).toFixed(1);
+  // T4.1: a spoofer broadcasts a bearing grossly off the honest one for the same
+  // target, so it lands far from the fused consensus and earns a low reputation.
+  if (SPOOF && Number.isFinite(SPOOF_DEG)) az = ((az + SPOOF_DEG) % 360 + 360) % 360;
   const draft = {
     kind: "aircraft",
     target,
     t: Math.floor(Date.now() / 1000),
-    az: FIXED_AZ != null && Number.isFinite(FIXED_AZ) ? FIXED_AZ : +(Math.random() * 360).toFixed(1),
+    az: +az.toFixed(1),
     el: FIXED_EL != null && Number.isFinite(FIXED_EL) ? FIXED_EL : +(Math.random() * 90).toFixed(1),
     obsCell: OBS_CELL,
   };

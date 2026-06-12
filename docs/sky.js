@@ -363,6 +363,10 @@ async function main() {
     // RF-integrity (T3.4): how many GPS spoof/jam zones k+ distinct nodes currently
     // corroborate — the headline count for the heat overlay.
     const rfZones = mesh.rfConfirmedZones ? mesh.rfConfirmedZones() : 0;
+    // Node reputation (T4.1): how many distinct nodes are currently distrusted —
+    // consistently disagreeing with the corroborated consensus, so down-weighted in
+    // fusion. 0 in a healthy mesh, so the segment stays hidden.
+    const distrusted = mesh.distrustedNodes ? mesh.distrustedNodes() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
@@ -371,6 +375,7 @@ async function main() {
       (confirmed ? ` · ⚠ ${confirmed} confirmed` : "") +
       (fedNodes ? ` · model ${fedNodes}n` : "") +
       (rfZones ? ` · RF ${rfZones} zone${rfZones === 1 ? "" : "s"}` : "") +
+      (distrusted ? ` · ⚑ ${distrusted} distrusted` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -592,6 +597,12 @@ async function main() {
         for (const tr of f.trackList) {
           tr.rfIntegrity = null;
           tr._rfVote = null;
+          // Reputation (T4.1): if this aircraft's network track is fused over a
+          // down-weighted node, surface that in the detail panel. Null when every
+          // contributor is trusted (the healthy case) or the target isn't on the
+          // network sky. Set before the position guard below so it shows even for a
+          // track with no local position fix this frame.
+          tr.fusionTrust = canon.get(tr.icao24)?.fusionTrust ?? null;
           const p = tr.points.length ? tr.points[tr.points.length - 1] : null;
           if (!p || !Number.isFinite(p.lat) || !Number.isFinite(p.lon)) continue;
           const info = mesh.localRf({ lat: p.lat, lon: p.lon, az: p.az, el: p.el, fused: canon.get(tr.icao24) }, nowSec);

@@ -57,6 +57,59 @@ function componentMedian(points) {
   return [median(xs), median(ys), median(zs)];
 }
 
+// Weighted median of (value, weight) pairs sorted ascending by value: the smallest
+// value whose cumulative weight reaches half the total. At an exact half-boundary it
+// averages the two bracketing values — so with EQUAL weights it reproduces `median`
+// exactly (even n → mean of the two central values), making the weighted fuse a
+// clean generalisation of the unweighted one. Non-finite/negative weights are
+// already screened out by the caller; if the total weight is ≤ 0 it falls back to
+// the plain median so a fully zero-weight axis still yields a centre.
+function weightedMedian(pairs) {
+  const sorted = pairs.slice().sort((a, b) => a.v - b.v || (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
+  let total = 0;
+  for (const p of sorted) total += p.w;
+  if (!(total > 0)) return median(sorted.map((p) => p.v));
+  const half = total / 2;
+  // A perfectly even split (the unweighted-median midpoint case) won't land on
+  // `cum === half` exactly once floats accumulate — equal weights at an even count
+  // miss it by ~1e-16, so the branch would be skipped and the fuse would diverge
+  // from `median()`. Detect the balance with a tolerance relative to the total: it
+  // reliably catches an exact split, and for genuinely-unequal weights `cum` is
+  // never this close to half (and if it somehow were, averaging two adjacent values
+  // is itself a valid weighted median at near-balance — no harm).
+  const eps = total * 1e-9;
+  let cum = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    cum += sorted[i].w;
+    if (cum < half - eps) continue;             // not yet at the half mark
+    if (cum <= half + eps) {                     // balanced here → midpoint (matches median)
+      return i + 1 < sorted.length ? (sorted[i].v + sorted[i + 1].v) / 2 : sorted[i].v;
+    }
+    return sorted[i].v;                          // strictly past half → this value
+  }
+  return sorted[sorted.length - 1].v; // unreachable (cum reaches total ≥ half)
+}
+
+// Reputation-weighted component-wise median. Each positioned source contributes its
+// ECEF with a weight = `weightOf(nodeId)` (a node's reputation, T4.1): a distrusted
+// outlier's near-zero weight all but removes its pull, so the fuse can out-vote a
+// down-weighted MAJORITY that a plain median (robust to only ⌊(n-1)/2⌋ outliers)
+// could not. With equal weights it equals `componentMedian`, so a healthy mesh
+// fuses identically. Order-independent (each axis sorts by (value, nodeId)). A
+// weight that is non-finite or < 0 is clamped to 0 so a hostile/buggy `weightOf`
+// can only silence a source, never poison the sort.
+function weightedComponentMedian(positioned, weightOf) {
+  const weighted = positioned.map((p) => {
+    let w;
+    try { w = weightOf(p.nodeId); } catch { w = 0; } // a throwing weightFor silences the source, never the fuse
+    if (!(typeof w === "number" && Number.isFinite(w) && w >= 0)) w = 0;
+    return { ...p, w };
+  });
+  return [0, 1, 2].map((axis) =>
+    weightedMedian(weighted.map((p) => ({ v: p.ecef[axis], w: p.w, k: p.nodeId }))),
+  );
+}
+
 function dist3(a, b) {
   return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 }
@@ -73,6 +126,13 @@ function dist3(a, b) {
  *        ECEF) but its az/el/range_m are null — there is no frame to render in,
  *        so `position` is the source of truth; an unfused track always reports
  *        the freshest source's own look regardless.
+ * @param {(nodeId:string)=>number} [opts.weightFor]
+ *        optional per-source reputation weight (T4.1, ADR-0008). When supplied, the
+ *        canonical `position` is a reputation-WEIGHTED component-median, so a
+ *        distrusted node's look is down-weighted out of the fuse. `residuals` stay
+ *        measured against the UNWEIGHTED median (the reputation-blind reference that
+ *        scores reputation — see reputation.js). Omitted → the position is the plain
+ *        component-median, byte-identical to before this option existed.
  * @returns {object|null} CanonicalTrack, or null for an empty track:
  *   { target, kind, sourceCount, nodeIds, lastSeen, payload,
  *     fused,        // true when a world position was reconstructed from ≥1 ranged source
@@ -81,7 +141,7 @@ function dist3(a, b) {
  *                                // fused track when no observer was supplied)
  *     residuals }                // Map<nodeId, metres from that source's world pos to canonical>
  */
-export function canonicalizeTrack(track, { observer } = {}) {
+export function canonicalizeTrack(track, { observer, weightFor } = {}) {
   const sources = track.observations();
   if (!sources.length) return null;
   const latest = track.latest();
@@ -110,9 +170,18 @@ export function canonicalizeTrack(track, { observer } = {}) {
   let az, el, range_m;
 
   if (positioned.length) {
-    position = componentMedian(positioned.map((p) => p.ecef));
+    // The reputation-BLIND reference: the plain component-median. Residuals are
+    // always measured against this, never against the weighted position below, so a
+    // node can't shrink its own residual by earning reputation (no rich-get-richer
+    // feedback) — reputation.js depends on this.
+    const reference = componentMedian(positioned.map((p) => p.ecef));
+    for (const p of positioned) residuals.set(p.nodeId, dist3(p.ecef, reference));
+    // The delivered position: reputation-weighted when weights are supplied (T4.1),
+    // else the reference itself (byte-identical to the pre-T4.1 behaviour).
+    position = typeof weightFor === "function"
+      ? weightedComponentMedian(positioned, weightFor)
+      : reference;
     fused = true;
-    for (const p of positioned) residuals.set(p.nodeId, dist3(p.ecef, position));
     // Render look: the fused world position as seen from the local observer.
     // Without an observer there's no frame, so the look stays null and the
     // contradiction "fused position but a raw, position-mismatched az/el" can't

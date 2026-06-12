@@ -235,3 +235,139 @@ test("a node's newer look supersedes its older one for the same target", async (
   a.dispose();
   b.dispose();
 });
+
+// ── T4.1 — node reputation, end-to-end with real Ed25519 ──────────────────────
+// The spec's "a misbehaving sim node loses reputation and influence": several
+// nodes report ONE target, most honestly and one grossly off; the node that fuses
+// them (which never echoes its own publishes) scores each peer's consistency with
+// the corroborated centre and down-weights the outlier.
+
+test("T4.1 — a persistently disagreeing node loses reputation; honest peers keep theirs", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const c = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const d = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  // e is a second pure observer (never publishes GHOST1). It receives the SAME
+  // signed Observations as a, so it must converge on the SAME reputations with no
+  // reputation gossip — the coordinator-free convergence claim, tested not asserted.
+  const e = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  const base = nowSec();
+  // Several rounds at advancing (still-fresh) times → one distinct reputation sample
+  // per round. b,c report consistent bearings; d sits ~110° off (≈ 85 km from the
+  // fused consensus at 60 km range), well past the 10 km agree gate.
+  for (let r = 0; r < 6; r++) {
+    const t = base - 6 + r;
+    await b.publish([{ kind: "aircraft", target: "GHOST1", t, az: 90, el: 30, range_m: 60000 }]);
+    await c.publish([{ kind: "aircraft", target: "GHOST1", t, az: 93, el: 30, range_m: 60000 }]);
+    await d.publish([{ kind: "aircraft", target: "GHOST1", t, az: 200, el: 30, range_m: 60000 }]);
+    a.canonicalTracks({ nowT: base }); // fold this round's residuals into a's reputation
+    e.canonicalTracks({ nowT: base }); // …and independently into e's
+  }
+
+  const repB = a.reputationOf(b.nodeId, base);
+  const repC = a.reputationOf(c.nodeId, base);
+  const repD = a.reputationOf(d.nodeId, base);
+  assert.ok(repD < repB && repD < repC, `spoofer ${repD} below honest ${repB}/${repC}`);
+  assert.ok(repD < 0.34, `spoofer is distrusted (${repD})`);
+  assert.ok(repB > 0.7 && repC > 0.7, `honest peers stay trusted (${repB}/${repC})`);
+
+  // Convergence: the independent observer e computed bit-identical scores.
+  assert.equal(e.reputationOf(d.nodeId, base), repD);
+  assert.equal(e.reputationOf(b.nodeId, base), repB);
+  assert.equal(e.distrustedNodes(base), a.distrustedNodes(base));
+
+  // Headline readout count: exactly the one spoofer is distrusted.
+  assert.equal(a.distrustedNodes(base), 1);
+  const reps = a.nodeReputations(base);
+  assert.equal(reps.find((n) => n.nodeId === d.nodeId)?.distrusted, true);
+  assert.equal(reps.find((n) => n.nodeId === b.nodeId)?.distrusted, false);
+
+  // Influence: the fused canonical track surfaces the down-weighted contributor so
+  // the detail panel can flag it (null until a contributor is actually distrusted).
+  const canon = a.canonicalTracks({ nowT: base }).find((t) => t.target === "GHOST1");
+  assert.equal(canon.sourceCount, 3);
+  assert.ok(canon.fusionTrust, "fusionTrust present once a contributor is distrusted");
+  assert.equal(canon.fusionTrust.distrusted, 1);
+  assert.ok(canon.fusionTrust.minRep < 0.34);
+
+  a.dispose(); b.dispose(); c.dispose(); d.dispose(); e.dispose();
+});
+
+test("T4.1 — below the ≥3-source floor, disagreement can't be attributed (no distrust)", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const c = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  const base = nowSec();
+  // Only TWO nodes report the target, and they disagree — but with two looks the
+  // residuals are symmetric (each is half their separation), so neither can be named
+  // the outlier. Nobody is scored down (the honest k=2 ambiguity, documented).
+  for (let r = 0; r < 6; r++) {
+    const t = base - 6 + r;
+    await b.publish([{ kind: "aircraft", target: "PAIR1", t, az: 90, el: 30, range_m: 60000 }]);
+    await c.publish([{ kind: "aircraft", target: "PAIR1", t, az: 200, el: 30, range_m: 60000 }]);
+    a.canonicalTracks({ nowT: base });
+  }
+  assert.equal(a.distrustedNodes(base), 0);
+  assert.equal(a.reputationOf(b.nodeId, base), 0.5); // untouched neutral prior
+  assert.equal(a.reputationOf(c.nodeId, base), 0.5);
+  assert.equal(a.reputationStats().tracksObserved, 0);
+
+  a.dispose(); b.dispose(); c.dispose();
+});
+
+test("T4.1 — a stale (non-co-temporal) source isn't scored, so slow honest nodes aren't punished", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const c = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const d = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  const base = nowSec();
+  // d reports ONCE, 60 s in the past (still inside the store TTL), with a bearing
+  // that disagrees — a slow node whose look has gone stale, NOT a spoofer.
+  await d.publish([{ kind: "aircraft", target: "SLOW1", t: base - 60, az: 200, el: 30, range_m: 60000 }]);
+  // b and c keep reporting fresh, consistent looks.
+  for (let r = 0; r < 6; r++) {
+    const t = base - 6 + r;
+    await b.publish([{ kind: "aircraft", target: "SLOW1", t, az: 90, el: 30, range_m: 60000 }]);
+    await c.publish([{ kind: "aircraft", target: "SLOW1", t, az: 93, el: 30, range_m: 60000 }]);
+    a.canonicalTracks({ nowT: base });
+  }
+  // Three positioned sources (so the minSources floor IS met), but the fuse spans
+  // ~60 s — past the co-temporal window — so reputation skips it: nobody, including
+  // the disagreeing-but-stale d, is scored down.
+  assert.equal(a.reputationStats().tracksObserved, 0);
+  assert.equal(a.distrustedNodes(base), 0);
+  assert.equal(a.reputationOf(d.nodeId, base), 0.5);
+
+  a.dispose(); b.dispose(); c.dispose(); d.dispose();
+});
+
+test("T4.1 — reputation is computed locally and never rides the wire (privacy)", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const c = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  const base = nowSec();
+  for (let r = 0; r < 4; r++) {
+    const t = base - 4 + r;
+    await b.publish([{ kind: "aircraft", target: "PRIV1", t, az: 90, el: 30, range_m: 60000 }]);
+    await c.publish([{ kind: "aircraft", target: "PRIV1", t, az: 200, el: 30, range_m: 60000 }]);
+    a.canonicalTracks({ nowT: base });
+  }
+  // Reputation lives only in a's ledger; nothing reputation-shaped is on any wire
+  // Observation (it isn't published at all).
+  for (const o of a.remoteTracks().flatMap((tr) => tr.observations())) {
+    const keys = deepKeys(o);
+    for (const k of ["reputation", "rep", "trust", "weight", "distrust"]) {
+      assert.ok(!keys.includes(k), `wire leaked a reputation field: ${k}`);
+    }
+  }
+
+  a.dispose(); b.dispose(); c.dispose();
+});

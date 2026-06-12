@@ -27,6 +27,7 @@ import { SharedNoveltyMemory } from "../src/mesh/shared-novelty.js";
 import { AnomalyConsensus } from "../src/mesh/consensus.js";
 import { FederatedAnomalyModel } from "../src/mesh/fedmodel.js";
 import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
+import { ReputationLedger } from "../src/mesh/reputation.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -35,6 +36,16 @@ import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
 // it for experiments; "qudag" is the in-process loopback (same tab only).
 const BUS_ID = "skygraph-edgenet";
 const TOPIC = "all-sky";
+
+// Reputation (T4.1) only scores a node from a CO-TEMPORAL fuse — one whose
+// positioned sources' looks fall within this many seconds of each other. The
+// network store keeps each node's LATEST look, so a slow-updating honest node's
+// stale look would disagree with a moving target's fresh consensus and be wrongly
+// scored down. A fuse spanning more than this is too time-smeared to attribute
+// disagreement fairly, so we skip it (no one is penalised). 15 s is below the
+// agree gate's staleness budget: a fast jet moves < ~4 km in 15 s, well under the
+// 10 km gate, so an honest node inside the window still agrees on its own merits.
+const REP_CO_TEMPORAL_WINDOW_S = 15;
 
 // Start the mesh layer for this node. `observer` is the LocalNode's vantage
 // point — only its COARSE cell ever reaches the wire (ADR-0007); raw lat/lon
@@ -83,6 +94,29 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // disagreement + timing drift"). Reads only the public cell/nodeId; a malformed vote
   // is ignored by `ingest`.
   const rf = new RfIntegrityMap();
+  // Node reputation (T4.1, ADR-0008): score each nodeId by its CONSISTENCY with the
+  // corroborated consensus — fed from the fusion residuals computed in
+  // `canonicalTracks` below — and feed those scores back as fusion weights so a
+  // persistently disagreeing/spoofing node loses pull on the fused sky. Reputation
+  // is derived locally and never gossiped: every node that has received the same
+  // Observations fuses identically and computes the same scores (coordinator-free,
+  // ADR-0005), so nothing new rides the wire (ADR-0007 holds).
+  const reputation = new ReputationLedger();
+  // The time span (seconds) of a track's POSITIONED sources — the ones reputation
+  // scores (those in `residuals`). Used to gate reputation on a co-temporal fuse
+  // (see REP_CO_TEMPORAL_WINDOW_S). Infinity when the store has no such track.
+  function sourceTimeSpan(target, residuals) {
+    const st = store.get(target);
+    if (!st) return Infinity;
+    let minT = Infinity;
+    let maxT = -Infinity;
+    for (const o of st.observations()) {
+      if (!residuals.has(o.nodeId)) continue; // only the scored, positioned sources
+      if (o.t < minT) minT = o.t;
+      if (o.t > maxT) maxT = o.t;
+    }
+    return maxT < minT ? Infinity : maxT - minT;
+  }
   function recordRf(obs) {
     // Like recordVote/recordGradient: `ingest` is written not to throw, but this step
     // has no internal error boundary the transport relies on, so guard it — a
@@ -203,7 +237,15 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // `residuals`. Pass the local observer so peers' tracks land where they
     // actually are in our sky, not at the peers' own (to us, meaningless) az/el.
     canonicalTracks: ({ nowT = Math.floor(Date.now() / 1000) } = {}) => {
-      const tracks = canonicalizeTracks(store.tracks(), { observer });
+      // Reputation-WEIGHT the fuse (T4.1): a node's pull on the canonical position is
+      // its reputation. weightFor reads scores accumulated on PRIOR frames (we fold
+      // THIS frame's residuals just below), so there's no within-call circularity —
+      // a one-frame feedback lag that converges. An unknown peer weighs the neutral
+      // prior, so a healthy mesh's weighted median equals the plain one.
+      const tracks = canonicalizeTracks(store.tracks(), {
+        observer,
+        weightFor: (nodeId) => reputation.weight(nodeId, nowT),
+      });
       for (const tr of tracks) {
         // Attach the DAG-backed first-seen provenance so the UI can show "first
         // seen by node X at T" on each network track without a second pass (T2.4).
@@ -214,6 +256,18 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         // this target anomalous, else { confirmed, voters, k, ... } so the UI can
         // badge confirmed (k+ nodes agree) vs unconfirmed (single-node) anomalies.
         tr.consensus = consensus.status(tr.target, { nowT });
+        // Reputation (T4.1): fold this fused track's reputation-BLIND residuals into
+        // per-node scores (a node consistent with the corroborated centre earns
+        // trust; a gross outlier loses it). Keyed (nodeId, target, lastSeen), so
+        // re-rendering the same frame is idempotent — calling this per render frame
+        // doesn't inflate scores. Only co-temporal fuses are scored (see
+        // REP_CO_TEMPORAL_WINDOW_S), so a slow honest node's stale look isn't mistaken
+        // for disagreement. Then attach the fusion-trust summary so the panel can flag
+        // a track fused over a down-weighted node (null when all trusted).
+        if (sourceTimeSpan(tr.target, tr.residuals) <= REP_CO_TEMPORAL_WINDOW_S) {
+          reputation.observeTrack({ target: tr.target, t: tr.lastSeen, residuals: tr.residuals });
+        }
+        tr.fusionTrust = reputation.trackTrust(tr.residuals, nowT);
       }
       return tracks;
     },
@@ -300,6 +354,17 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     rfConfirmedZones: (nowT = Math.floor(Date.now() / 1000)) => rf.confirmedCount(nowT),
     // RF map roll-up for diagnostics/tests.
     rfStats: () => ({ zones: rf.size, ...rf.stats }),
+    // Node reputation (T4.1). One node's consistency-with-consensus score in [0,1] —
+    // the neutral prior until it has fresh samples, then earned/lost over time.
+    reputationOf: (nodeId, nowT = Math.floor(Date.now() / 1000)) => reputation.reputation(nodeId, nowT),
+    // How many distinct nodes are currently distrusted (consistently disagreeing with
+    // the corroborated consensus) — the headline count for the network-sky readout.
+    distrustedNodes: (nowT = Math.floor(Date.now() / 1000)) => reputation.distrustedCount(nowT),
+    // Every scored node's reputation view, ordered by nodeId — diagnostics / a future
+    // leaderboard (T4.2). Each: { nodeId, reputation, samples, distrusted }.
+    nodeReputations: (nowT = Math.floor(Date.now() / 1000)) => reputation.nodes({ nowT }),
+    // Reputation roll-up for diagnostics/tests.
+    reputationStats: () => ({ nodes: reputation.size, ...reputation.stats }),
     // Edge detection for one of THIS node's live looks (T3.4). Folds the two reads
     // sky.js needs into one call so it never touches `src/mesh` or the coarse-cell
     // math directly: (1) the cell this aircraft is over and the network's RF verdict
@@ -331,7 +396,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // Age out stale state on the caller's cadence: the network store's sources AND
     // the consensus memory's votes (both keyed to the same freshness window, so a
     // target that drops off the sky also drops out of consensus).
-    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); return s; },
+    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); reputation.prune(now); return s; },
     // Cumulative transport + store counters, for diagnostics/tests.
     stats: () => ({ transport: transport.stats, store: store.stats }),
     dispose: () => { off(); transport.leave(); },

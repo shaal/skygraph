@@ -13,6 +13,7 @@ import { canonicalizeTrack, canonicalizeTracks } from "../../src/mesh/fusion.js"
 import { decodeCell, geodeticToEcef } from "../../src/mesh/geo.js";
 import { NetworkTrackStore } from "../../src/mesh/network-store.js";
 import { createIdentity, sign, coarseCell } from "../../src/mesh/observation.js";
+import { ReputationLedger } from "../../src/mesh/reputation.js";
 import { geodeticToEcef as appGeodeticToEcef, observerFrameJs } from "../project.js";
 
 const LOCAL = { lat: 43.45, lon: -79.68, alt_m: 100 }; // this node's render frame
@@ -171,6 +172,137 @@ test("a lone outlier does not drag the canonical position (median resists it)", 
   // many km from the canonical; the honest pair are within metres.
   assert.ok(canon.residuals.get(c.nodeId) > 5000, "outlier residual large");
   assert.ok(canon.residuals.get(a.nodeId) < 1000 && canon.residuals.get(b.nodeId) < 1000);
+});
+
+// ── reputation-weighted fuse (T4.1) ──────────────────────────────────────────
+
+test("weightFor with equal weights reproduces the plain median exactly", async () => {
+  const a = await createIdentity();
+  const b = await createIdentity();
+  const c = await createIdentity();
+  const truth = { lat: 43.62, lon: -79.40, alt_m: 10000 };
+  const store = new NetworkTrackStore();
+  ingestAll(store, [
+    await look(a, coarseCell(43.45, -79.68), "WEQ001", truth),
+    await look(b, coarseCell(43.50, -79.60), "WEQ001", truth),
+    await look(c, coarseCell(43.55, -79.55), "WEQ001", truth),
+  ]);
+  const plain = canonicalizeTrack(store.get("WEQ001"), { observer: LOCAL });
+  const weighted = canonicalizeTrack(store.get("WEQ001"), { observer: LOCAL, weightFor: () => 0.5 });
+  assert.deepEqual(weighted.position, plain.position); // equal weights ⇒ identical fuse
+  assert.deepEqual([...weighted.residuals.entries()].sort(), [...plain.residuals.entries()].sort());
+});
+
+test("weightFor with equal NON-trivial weights still reproduces the plain median (even count)", async () => {
+  // Regression guard for the weighted-median float-boundary: with an EVEN number of
+  // sources at an equal, non-{0.5,1} weight (0.7), the exact-balance midpoint must
+  // still be taken — else the fuse silently diverges from the unweighted median.
+  const ids = await Promise.all([0, 1, 2, 3].map(() => createIdentity()));
+  const cells = [[43.45, -79.68], [43.50, -79.60], [43.55, -79.55], [43.60, -79.50]];
+  const truth = { lat: 43.62, lon: -79.40, alt_m: 10000 };
+  const store = new NetworkTrackStore();
+  ingestAll(store, await Promise.all(ids.map((id, i) => look(id, coarseCell(...cells[i]), "WEVEN4", truth))));
+  const plain = canonicalizeTrack(store.get("WEVEN4"), { observer: LOCAL });
+  const weighted = canonicalizeTrack(store.get("WEVEN4"), { observer: LOCAL, weightFor: () => 0.7 });
+  assert.deepEqual(weighted.position, plain.position);
+});
+
+test("a trusted minority out-votes a distrusted majority (weighted median beats plain)", async () => {
+  // The headline of T4.1 down-weighting: two spoofers AGREE on a wrong position and
+  // a single honest node reports the truth. The plain median (robust to only one
+  // outlier of three) follows the 2-spoofer majority; a reputation-weighted median
+  // that already distrusts them (low weight earned elsewhere) follows the honest one.
+  const h = await createIdentity();
+  const s1 = await createIdentity();
+  const s2 = await createIdentity();
+  const truth = { lat: 43.62, lon: -79.40, alt_m: 10000 };
+  const cellH = coarseCell(43.45, -79.68);
+  const cellS = coarseCell(43.55, -79.55); // both spoofers share a cell + bearing error
+  const store = new NetworkTrackStore();
+  ingestAll(store, [
+    await look(h, cellH, "WMAJ02", truth),
+    await look(s1, cellS, "WMAJ02", truth, (d) => ({ ...d, az: (d.az + 90) % 360 })),
+    await look(s2, cellS, "WMAJ02", truth, (d) => ({ ...d, az: (d.az + 90) % 360 })),
+  ]);
+  const truthEcef = geodeticToEcef(truth.lat, truth.lon, truth.alt_m);
+
+  // Plain fuse: the two identical spoofer reconstructions dominate the per-axis
+  // median → far from truth.
+  const plain = canonicalizeTrack(store.get("WMAJ02"), { observer: LOCAL });
+  assert.equal(plain.sourceCount, 3);
+  assert.ok(dist3(plain.position, truthEcef) > 20000, "plain median follows the spoofer majority");
+
+  // Weighted fuse: the honest node's weight (0.9) alone exceeds half the total, so
+  // the weighted median is its value on every axis → back on truth.
+  const wf = (nodeId) => (nodeId === h.nodeId ? 0.9 : 0.05);
+  const weighted = canonicalizeTrack(store.get("WMAJ02"), { observer: LOCAL, weightFor: wf });
+  assert.ok(dist3(weighted.position, truthEcef) < 1000, "weighted median follows the trusted honest node");
+
+  // Residuals are reputation-BLIND in both: measured vs the unweighted median, so a
+  // node can't shrink its own residual by being trusted (no rich-get-richer).
+  assert.deepEqual([...weighted.residuals.entries()].sort(), [...plain.residuals.entries()].sort());
+});
+
+test("closing the loop: reputation EARNED through the ledger moves the fused position", async () => {
+  // The two halves the reviewers flagged — "earned reputation" and "moved position" —
+  // proven in ONE test. Phase 1: two spoofers earn a low reputation as a MINORITY on
+  // one target (3 honest corroborators outvote them). Phase 2: on a DIFFERENT target
+  // where the same two spoofers are now the local majority (2 spoofers + 1 honest),
+  // their already-earned low reputation pulls them out of the weighted fuse — where a
+  // plain median would follow them. Reputation is a global per-node property.
+  const [h1, h2, h3, s1, s2] = await Promise.all([0, 0, 0, 0, 0].map(() => createIdentity()));
+  const led = new ReputationLedger();
+
+  // Phase 1 — earn. Real nodeIds so the weights carry into the fuse below. Spoofers
+  // (s1,s2) sit far from the corroborated centre; the three honest nodes agree.
+  const earn = new Map([
+    [h1.nodeId, 500], [h2.nodeId, 700], [h3.nodeId, 900], [s1.nodeId, 80000], [s2.nodeId, 85000],
+  ]);
+  for (let t = 1; t <= 8; t++) led.observeTrack({ target: "EARN", t, residuals: earn });
+  assert.ok(led.weight(h1.nodeId, 8) > 0.8, "honest earned high");
+  assert.ok(led.weight(s1.nodeId, 8) < 0.2 && led.weight(s2.nodeId, 8) < 0.2, "spoofers earned low");
+
+  // Phase 2 — apply. A new target: one honest look at truth, two spoofers sharing a
+  // cell + a 100° bearing error so they reconstruct to ONE wrong position (a majority
+  // cluster of 2 of 3).
+  const truth = { lat: 43.62, lon: -79.40, alt_m: 10000 };
+  const cellH = coarseCell(43.45, -79.68);
+  const cellS = coarseCell(43.55, -79.55);
+  const store = new NetworkTrackStore();
+  ingestAll(store, [
+    await look(h1, cellH, "APPLY1", truth),
+    await look(s1, cellS, "APPLY1", truth, (d) => ({ ...d, az: (d.az + 100) % 360 })),
+    await look(s2, cellS, "APPLY1", truth, (d) => ({ ...d, az: (d.az + 100) % 360 })),
+  ]);
+  const truthEcef = geodeticToEcef(truth.lat, truth.lon, truth.alt_m);
+
+  const plain = canonicalizeTrack(store.get("APPLY1"), { observer: LOCAL });
+  assert.ok(dist3(plain.position, truthEcef) > 20000, "plain median follows the 2-spoofer majority");
+
+  const weighted = canonicalizeTrack(store.get("APPLY1"), { observer: LOCAL, weightFor: (id) => led.weight(id, 8) });
+  assert.ok(dist3(weighted.position, truthEcef) < 1000, "earned-low reputation pulls the spoofers out of the fuse");
+});
+
+test("a non-finite or negative weight is clamped to zero (hostile weightFor can't poison the fuse)", async () => {
+  const a = await createIdentity();
+  const b = await createIdentity();
+  const c = await createIdentity();
+  const truth = { lat: 43.62, lon: -79.40, alt_m: 10000 };
+  const store = new NetworkTrackStore();
+  ingestAll(store, [
+    await look(a, coarseCell(43.45, -79.68), "WCLP03", truth),
+    await look(b, coarseCell(43.50, -79.60), "WCLP03", truth),
+    await look(c, coarseCell(43.55, -79.55), "WCLP03", truth, (d) => ({ ...d, az: (d.az + 120) % 360 })),
+  ]);
+  const truthEcef = geodeticToEcef(truth.lat, truth.lon, truth.alt_m);
+  // c is the outlier; a,b honest. Garbage weights for a and b are clamped to 0,
+  // leaving only c with positive weight — so a buggy weightFor degrades to "trust
+  // c", never throws or NaNs the position. The point: it stays finite + computable.
+  const wf = (nodeId) => (nodeId === a.nodeId ? NaN : nodeId === b.nodeId ? -3 : 1);
+  const weighted = canonicalizeTrack(store.get("WCLP03"), { observer: LOCAL, weightFor: wf });
+  assert.ok(Array.isArray(weighted.position) && weighted.position.every(Number.isFinite));
+  // Only c has weight → the fuse sits on c's (outlier) reconstruction, far from truth.
+  assert.ok(dist3(weighted.position, truthEcef) > 5000, "clamped weights left only c contributing");
 });
 
 test("no source carries range → fall back to the freshest look, unfused", async () => {
