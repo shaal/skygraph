@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 
 import { startMeshLayer } from "../mesh-layer.js";
 import { _resetBuses } from "../../src/mesh/transport.js";
+import { createWifiCsiSensor } from "../../src/mesh/sensors.js";
 
 const OBSERVER = { name: "test", lat: 43.4675, lon: -79.6877, alt_m: 100 };
 let busSeq = 0;
@@ -448,4 +449,70 @@ test("T4.2 — rUv is derived locally; nothing rUv-shaped or location-bearing ri
   }
 
   a.dispose(); b.dispose();
+});
+
+test("T5.1 — a WiFi-CSI sensor modality flows from a node to the network sky", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  // b carries a non-ADS-B modality. Inject a fixed detection so the test is
+  // deterministic (the in-browser default synthesises a moving contact instead).
+  b.sensors.register(createWifiCsiSensor({ detect: () => [{ az: 120, el: 30, range_m: 8000, strength: 0.6 }] }));
+  const base = nowSec();
+
+  // The publish path is identical to aircraft: collect the modality's drafts and
+  // gossip them. A node with NO sensor plugin (a) collects nothing — the default app.
+  assert.deepEqual(a.collectSensors(base), []);
+  const drafts = b.collectSensors(base);
+  assert.equal(drafts.length, 1);
+  assert.equal(drafts[0].kind, "sensor");
+  assert.equal(drafts[0].payload.sensor, "wifi-csi");
+  const sent = await b.publish(drafts);
+  assert.equal(sent, 1);
+
+  // The contact reached a's network sky as a non-aircraft canonical track.
+  assert.equal(a.sensorContacts(), 1);
+  assert.deepEqual(b.sensorModalities(), ["wifi-csi"]); // b emits the modality; a carries none
+  assert.deepEqual(a.sensorModalities(), []);
+  const canon = a.canonicalTracks({ nowT: base });
+  assert.equal(canon.length, 1);
+  const tr = canon[0];
+  assert.equal(tr.kind, "sensor");
+  assert.equal(tr.target, "csi-contact-1");
+  assert.equal(tr.payload.sensor, "wifi-csi");
+  assert.equal(tr.fused, true);                                   // ranged → placed in world space
+  assert.ok(Number.isFinite(tr.az) && Number.isFinite(tr.el));   // reprojected into a's frame
+
+  // Privacy (ADR-0007): the wire record carries only the coarse cell, never a
+  // coordinate — the modality adds no location.
+  const o = a.remoteTracks()[0].latest();
+  for (const k of deepKeys(o)) {
+    assert.ok(!["lat", "lon", "alt", "alt_m", "latitude", "longitude"].includes(k), `wire leaked: ${k}`);
+  }
+  assert.match(o.obsCell, /^[0-9bcdefghjkmnpqrstuvwxyz]+$/);
+
+  a.dispose(); b.dispose();
+});
+
+test("T5.1 — two sensor nodes corroborating one contact fuse into a ×2 on a third", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: { name: "b", lat: 43.47, lon: -79.69, alt_m: 100 }, kind: "qudag", busId: bus, topic: "t" });
+  const c = await startMeshLayer({ observer: { name: "c", lat: 43.46, lon: -79.66, alt_m: 100 }, kind: "qudag", busId: bus, topic: "t" });
+  const base = nowSec();
+
+  // b and c both see the SAME contact id from slightly different vantage points.
+  b.sensors.register(createWifiCsiSensor({ detect: () => [{ az: 120, el: 30, range_m: 8000 }] }));
+  c.sensors.register(createWifiCsiSensor({ detect: () => [{ az: 122, el: 31, range_m: 8000 }] }));
+  await b.publish(b.collectSensors(base));
+  await c.publish(c.collectSensors(base));
+
+  assert.equal(a.sensorContacts(), 1);             // one contact, two sources
+  const tr = a.canonicalTracks({ nowT: base })[0];
+  assert.equal(tr.kind, "sensor");
+  assert.equal(tr.sourceCount, 2);                 // rendered once, badged ×2
+  assert.equal(tr.payload.sensor, "wifi-csi");
+
+  a.dispose(); b.dispose(); c.dispose();
 });

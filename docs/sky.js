@@ -170,6 +170,18 @@ async function main() {
     try {
       const { startMeshLayer } = await import("./mesh-layer.js");
       mesh = await startMeshLayer({ observer: OBSERVER });
+      // Sensor plugin interface (T5.1): a node can carry sensing modalities beyond
+      // ADS-B aircraft. `?sensor=wifi-csi` attaches the RuView WiFi-CSI presence
+      // sensor (a synthetic demo source in-browser — there's no Wi-Fi radio in a
+      // tab); its contacts ride the generic `sensor` kind and flow to the network
+      // sky like any other track. Off by default, so the real app is unchanged.
+      // `?sensortarget=` shares one contact id across tabs so they fuse into a ×N.
+      const sensorParam = new URLSearchParams(location.search).get("sensor");
+      if (mesh && sensorParam) {
+        const { createWifiCsiSensor } = await import("../src/mesh/sensors.js");
+        const target = new URLSearchParams(location.search).get("sensortarget") || undefined;
+        mesh.sensors.register(createWifiCsiSensor({ modality: sensorParam, target }));
+      }
     } catch (e) {
       console.warn("[edgenet] network sky unavailable:", e?.message || e);
     }
@@ -386,9 +398,15 @@ async function main() {
     // k+ signed misbehavior reports agree, so their looks are excluded from the fuse
     // entirely. 0 in a healthy mesh, so the segment stays hidden.
     const slashed = mesh.slashedNodes ? mesh.slashedNodes() : 0;
+    // Sensor contacts (T5.1): non-aircraft modality tracks (e.g. WiFi-CSI presence)
+    // the network is currently showing — the headline count for a second modality
+    // reaching the network sky. 0 unless a node is running a sensor plugin, so the
+    // segment stays hidden in a plain ADS-B mesh.
+    const sensors = mesh.sensorContacts ? mesh.sensorContacts() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
+      (sensors ? ` · ◇ ${sensors} sensor${sensors === 1 ? "" : "s"}` : "") +
       (dag.vertices ? ` · DAG ${dag.vertices} vtx` : "") +
       (memSize ? ` · mem ${memSize} emb` : "") +
       (confirmed ? ` · ⚠ ${confirmed} confirmed` : "") +
@@ -880,6 +898,9 @@ async function main() {
   // draw.js stays byte-identical (it just renders the string we hand it).
   function networkLabel(v, nowSec) {
     const parts = [];
+    // Sensor modality (T5.1): a non-aircraft contact names its modality (e.g.
+    // "wifi-csi") so a network sky mixing ADS-B + sensor tracks stays legible.
+    if (v.kind === "sensor" && v.payload?.sensor) parts.push(String(v.payload.sensor).slice(0, 24));
     if (v.payload?.call) parts.push(String(v.payload.call));
     const prov = v.provenance;
     if (prov) parts.push(`1st ${String(prov.nodeId).slice(-5)} ${Math.max(0, nowSec - prov.t)}s`);
@@ -936,7 +957,12 @@ async function main() {
     setInterval(() => {
       mesh.prune();
       if (!replay.active && !document.hidden) {
-        mesh.publish(localObservations(Math.floor(Date.now() / 1000))).catch(() => {});
+        // Publish this node's aircraft looks AND any registered sensor modalities'
+        // contacts (T5.1) in one batch — both ride the same signed-Observation path.
+        const nowSec = Math.floor(Date.now() / 1000);
+        const drafts = localObservations(nowSec);
+        if (mesh.collectSensors) for (const d of mesh.collectSensors(nowSec)) drafts.push(d);
+        mesh.publish(drafts).catch(() => {});
       }
       if (CFG.networkSky) updateMeshReadout();
       if (CFG.coverageHeatmap) updateCoverage();

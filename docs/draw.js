@@ -141,7 +141,16 @@ export function drawNetworkTrack(ctx, view, w, h, opts = {}) {
   const r = view.kind === "satellite" ? 5 : 6.5;
   ctx.lineWidth = 1.5;
   ctx.globalAlpha = 0.9;
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath();
+  if (view.kind === "sensor") {
+    // A non-cooperative sensor contact (e.g. WiFi-CSI presence, T5.1) draws as a
+    // DIAMOND, not a ring, so a second modality reads distinctly from the aircraft/
+    // satellite rings on a mixed network sky. Same violet, centre dot, and ×N badge.
+    ctx.moveTo(x, y - r); ctx.lineTo(x + r, y); ctx.lineTo(x, y + r); ctx.lineTo(x - r, y); ctx.closePath();
+  } else {
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+  ctx.stroke();
   ctx.globalAlpha = 0.65;
   ctx.beginPath(); ctx.arc(x, y, 1.5, 0, Math.PI * 2); ctx.fill();
   // Sources count: shown regardless of the label toggle — corroboration across

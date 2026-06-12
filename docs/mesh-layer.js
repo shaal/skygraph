@@ -30,6 +30,7 @@ import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
 import { ReputationLedger } from "../src/mesh/reputation.js";
 import { ContributionLedger } from "../src/mesh/ruv.js";
 import { SlashingLedger } from "../src/mesh/slashing.js";
+import { createSensorRegistry, SENSOR_KIND } from "../src/mesh/sensors.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -123,6 +124,14 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // malformed report is ignored by `ingest`. Sybil-hardening (weighting a report by the
   // reporter's reputation) is the documented T4.1 follow-up.
   const slashing = new SlashingLedger();
+  // Sensor plugin registry (T5.1, ADR-0001 multimodal): the node's EXTRA sensing
+  // modalities beyond ADS-B aircraft. `sky.js` registers what this node carries
+  // (e.g. a RuView WiFi-CSI presence sensor); the publish tick gossips their
+  // drafts alongside the local aircraft looks via `collectSensors`. Each rides the
+  // generic `sensor` kind + a `payload.sensor` modality tag (sensors.js), so the
+  // already modality-agnostic store/fusion/render path carries them to the network
+  // sky with no special-casing. Empty by default → the real app is unchanged.
+  const sensors = createSensorRegistry();
   // The time span (seconds) of a track's POSITIONED sources — the ones reputation
   // scores (those in `residuals`). Used to gate reputation on a co-temporal fuse
   // (see REP_CO_TEMPORAL_WINDOW_S). Infinity when the store has no such track.
@@ -263,6 +272,21 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   return {
     nodeId: identity.nodeId,
     kind,
+    // Sensor plugin interface (T5.1): `sky.js` calls `sensors.register(plugin)` to
+    // attach an extra modality (e.g. createWifiCsiSensor); `collectSensors(nowSec)`
+    // returns this tick's modality drafts to publish alongside the aircraft looks.
+    sensors,
+    collectSensors: (nowSec) => sensors.collect({ nowSec }),
+    // The distinct sensor modalities this node currently emits (for the readout).
+    sensorModalities: () => sensors.modalities(),
+    // How many of the network sky's tracks are non-aircraft sensor contacts (the
+    // T5.1 headline count: a second modality reaching the network sky). Counts
+    // PEERS' contacts — our own looks aren't echoed back into the store.
+    sensorContacts: () => {
+      let n = 0;
+      for (const tr of store.tracks()) if (tr.kind === SENSOR_KIND) n++;
+      return n;
+    },
     // Live readout for the "N nodes online" UI: peers excludes self.
     peerCount: () => transport.peers().length,
     nodeCount: () => transport.peers().length + 1,

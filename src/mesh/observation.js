@@ -23,6 +23,10 @@
 
 export const OBSERVATION_VERSION = 1;
 export const OBSERVATION_KINDS = ["aircraft", "satellite", "sensor"];
+// Max length of the `payload.sensor` modality tag that generalizes the `sensor`
+// kind into an open set of sensing modalities (T5.1). See validateObservation and
+// the sensor plugin interface in sensors.js (which builds on this constant).
+export const SENSOR_MODALITY_MAX = 32;
 
 // On-wire required fields of a *signed* Observation. Kept as a constant so the
 // JSON Schema's `required` can be asserted equal to it (see the test suite).
@@ -193,6 +197,17 @@ export function validateObservation(obs, { requireSig = true } = {}) {
   if (obs.payload !== undefined) {
     if (obs.payload === null || typeof obs.payload !== "object" || Array.isArray(obs.payload)) {
       errors.push("payload, if present, must be an object");
+    } else if (obs.payload.sensor !== undefined) {
+      // The modality discriminator that generalizes the `sensor` kind (T5.1): a
+      // short tag (e.g. "wifi-csi") so a non-aircraft/non-satellite Observation
+      // self-describes which sensing modality produced it, without opening the
+      // closed `kind` enum (ADR-0004's payload extensibility point). Validated to
+      // a bounded non-empty string so a hostile peer can't smuggle an object or a
+      // megabyte through it; the modality SET itself stays open (a receiver need
+      // not know every modality to carry the record).
+      if (typeof obs.payload.sensor !== "string" || obs.payload.sensor.length === 0 || obs.payload.sensor.length > SENSOR_MODALITY_MAX) {
+        errors.push(`payload.sensor, if present, must be a 1..${SENSOR_MODALITY_MAX} char modality string`);
+      }
     }
   }
   if (typeof obs.nodeId !== "string" || !NODE_ID_RE.test(obs.nodeId)) {

@@ -74,6 +74,14 @@ const SPOOF_DEG = params.has("spoofdeg") ? Number(params.get("spoofdeg")) : 90;
 //   reporter: (a second tab, same slashtarget) — two reporters slash the spoofer.
 const SLASH_TARGET = params.get("slashtarget") || "";
 const SLASH_REASON = params.get("slashreason") || "spoof";
+// T5.1 sensor modality injection. `?sensor=<modality>` makes this tab publish a
+// NON-aircraft sensor contact (kind "sensor", `payload.sensor=<modality>`) instead
+// of a synthetic aircraft, so a second modality can be injected into the live app's
+// network sky — it renders as a violet DIAMOND (not a ring) and lights the readout's
+// "◇ N sensors". Defaults its target to "csi-contact-1" and range to 6 km so two
+// tabs fuse into one ×2 contact; pin ?target=/?az=/?el=/?range= to override. E.g.:
+//   ?bus=skygraph-edgenet&topic=all-sky&sensor=wifi-csi
+const SENSOR = params.get("sensor") || "";
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -101,20 +109,27 @@ function logLine(msg) {
 // nodes would derive these from ADS-B; here they're invented so peers have
 // something to exchange.
 async function makeObservation() {
-  const target = FIXED_TARGET || "SIM" + Math.floor(100 + Math.random() * 900);
+  // T5.1: in sensor mode default the target to the WiFi-CSI plugin's contact id so
+  // co-located tabs (and the app's own plugin) corroborate ONE contact and fuse it.
+  const target = FIXED_TARGET || (SENSOR ? "csi-contact-1" : "SIM" + Math.floor(100 + Math.random() * 900));
   let az = FIXED_AZ != null && Number.isFinite(FIXED_AZ) ? FIXED_AZ : +(Math.random() * 360).toFixed(1);
   // T4.1: a spoofer broadcasts a bearing grossly off the honest one for the same
   // target, so it lands far from the fused consensus and earns a low reputation.
   if (SPOOF && Number.isFinite(SPOOF_DEG)) az = ((az + SPOOF_DEG) % 360 + 360) % 360;
   const draft = {
-    kind: "aircraft",
+    kind: SENSOR ? "sensor" : "aircraft",
     target,
     t: Math.floor(Date.now() / 1000),
     az: +az.toFixed(1),
     el: FIXED_EL != null && Number.isFinite(FIXED_EL) ? FIXED_EL : +(Math.random() * 90).toFixed(1),
     obsCell: OBS_CELL,
   };
+  // Sensor contacts default to a finite range so they place in world space and
+  // reproject per observer (the plugin does the same); aircraft omit it unless pinned.
   if (FIXED_RANGE != null && Number.isFinite(FIXED_RANGE)) draft.range_m = FIXED_RANGE;
+  else if (SENSOR) draft.range_m = 6000;
+  // T5.1: tag the modality so the contact self-describes which sensor produced it.
+  if (SENSOR) draft.payload = { ...(draft.payload || {}), sensor: SENSOR };
   // T3.4: attach an RF-integrity vote so this tab corroborates a spoof/jam zone. The
   // affected cell defaults to a FIXED demo cell (the shared BASE point, not this tab's
   // own jittered location) so two tabs without `?rfcell=` still vote for the SAME zone

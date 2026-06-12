@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import {
   createIdentity, sign, verify, validateObservation, canonicalBytes,
   coarseCell, OBSERVATION_VERSION, OBSERVATION_KINDS, REQUIRED_FIELDS,
+  SENSOR_MODALITY_MAX,
 } from "../../src/mesh/observation.js";
 
 const SCHEMA = JSON.parse(
@@ -140,6 +141,32 @@ test("validation: each structural rule rejects", () => {
   for (const [label, obs] of Object.entries(bad)) {
     assert.ok(validateObservation(obs).length > 0, `${label} should be rejected`);
   }
+});
+
+test("validation: the sensor-modality discriminator (T5.1)", async () => {
+  // The generic `sensor` kind self-describes its modality via a bounded
+  // `payload.sensor` string — the generalization of `kind` without opening the
+  // closed enum. A sensor Observation round-trips sign/verify.
+  const id = await createIdentity();
+  const sensorDraft = draft({
+    kind: "sensor", target: "csi-contact-1", range_m: 6000,
+    payload: { sensor: "wifi-csi", strength: 0.7 },
+  });
+  const obs = await sign(sensorDraft, id);
+  assert.equal(await verify(obs), true);
+  assert.deepEqual(validateObservation(obs), []);
+
+  const base = { ...draft({ kind: "sensor" }), nodeId: "pk:11111111111111111111111111111111", sig: "AAAA" };
+  assert.deepEqual(validateObservation({ ...base, payload: { sensor: "wifi-csi" } }), []);
+  for (const badSensor of ["", 7, {}, [], "x".repeat(SENSOR_MODALITY_MAX + 1)]) {
+    assert.ok(
+      validateObservation({ ...base, payload: { sensor: badSensor } }).some((e) => /payload\.sensor/.test(e)),
+      `payload.sensor=${JSON.stringify(badSensor)} should be rejected`,
+    );
+  }
+  // A tamper on payload.sensor flips the signature (it's inside the canonical bytes).
+  const tampered = { ...obs, payload: { ...obs.payload, sensor: "weather" } };
+  assert.equal(await verify(tampered), false);
 });
 
 test("validation: requireSig toggles the sig requirement", () => {
