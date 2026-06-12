@@ -124,23 +124,34 @@ export function drawTrack(ctx, tr, t, w, h, selected, cfg) {
   return true;
 }
 
-// Draw one remote ("network sky") track from a peer's latest Observation — an
-// az/el look gossiped over the mesh (T1.4). Distinct violet ring + faint centre
-// so it stands apart from local filled dots and stays visible when it overlaps
-// one. `obs` is a frozen Observation ({ az, el, kind, payload }); `label`, when
-// given, is drawn alongside. Returns whether it landed above the horizon.
-export function drawNetworkTrack(ctx, obs, w, h, label) {
-  const [x, y, visible] = polarScreenXY(obs.az, obs.el, w, h);
+// Draw one remote ("network sky") track — a fused canonical track (T2.1)
+// reprojected into this observer's frame. Distinct violet ring + faint centre so
+// it stands apart from local filled dots and stays visible when it overlaps one.
+// `view` carries { az, el, kind }; `opts.label`, when given, is drawn alongside,
+// and `opts.sources` (how many nodes corroborate this target) is badged as ×N
+// when ≥2 so the dedup/fusion is visible on the dome. Returns whether it landed
+// above the horizon.
+export function drawNetworkTrack(ctx, view, w, h, opts = {}) {
+  const [x, y, visible] = polarScreenXY(view.az, view.el, w, h);
   if (!visible) return false;
+  const { label = null, sources = 1 } = opts;
   ctx.save();
   ctx.strokeStyle = NETWORK_COLOR;
   ctx.fillStyle = NETWORK_COLOR;
-  const r = obs.kind === "satellite" ? 5 : 6.5;
+  const r = view.kind === "satellite" ? 5 : 6.5;
   ctx.lineWidth = 1.5;
   ctx.globalAlpha = 0.9;
   ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
   ctx.globalAlpha = 0.65;
   ctx.beginPath(); ctx.arc(x, y, 1.5, 0, Math.PI * 2); ctx.fill();
+  // Sources count: shown regardless of the label toggle — corroboration across
+  // nodes is the whole point of the network sky, so it should always be legible
+  // when more than one node sees the target.
+  if (sources >= 2) {
+    ctx.globalAlpha = 1;
+    ctx.font = "bold 9px monospace";
+    ctx.fillText(`×${sources}`, x + r - 1, y - r - 1);
+  }
   if (label) {
     ctx.globalAlpha = 0.9;
     ctx.font = "10px monospace";

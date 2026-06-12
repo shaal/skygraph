@@ -104,6 +104,42 @@ test("dispose drops the node from its peer's count", async () => {
   b.dispose();
 });
 
+test("canonicalTracks fuses two corroborating peers into one ×N track (T2.1)", async () => {
+  const bus = freshBus();
+  // Three nodes on one bus: b and c both report the SAME target, so a (which
+  // never echoes its own publishes) sees two sources for it and must collapse
+  // them into a single canonical track carrying a sources count of 2.
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const c = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  // Slightly different az/el (different vantage points) but the same target +
+  // range — the reconcile-overlapping-observers case.
+  await b.publish([aircraftDraft("f00d01", 90, 30, { range_m: 60000, payload: { call: "FUSE" } })]);
+  await c.publish([aircraftDraft("f00d01", 92, 31, { range_m: 60000 })]);
+
+  // a's raw store holds two sources; canonicalTracks collapses them to one.
+  assert.equal(a.remoteCount(), 1);
+  const canon = a.canonicalTracks();
+  assert.equal(canon.length, 1);
+  const tr = canon[0];
+  assert.equal(tr.target, "f00d01");
+  assert.equal(tr.sourceCount, 2);     // rendered once, badged ×2
+  assert.equal(tr.fused, true);
+  assert.equal(tr.residuals.size, 2);  // both sources placed in world space
+  assert.ok(Array.isArray(tr.position) && tr.position.length === 3);
+  assert.ok(Number.isFinite(tr.az) && Number.isFinite(tr.el) && Number.isFinite(tr.range_m));
+
+  // b only sees c's single look (no self-echo) → one source, still fused.
+  const bCanon = b.canonicalTracks();
+  assert.equal(bCanon.length, 1);
+  assert.equal(bCanon[0].sourceCount, 1);
+
+  a.dispose();
+  b.dispose();
+  c.dispose();
+});
+
 test("a node's newer look supersedes its older one for the same target", async () => {
   const bus = freshBus();
   const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });

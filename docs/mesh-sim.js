@@ -10,6 +10,13 @@
 // plus ?topic= (default "sky"), ?bus= (default "skygraph"), ?rate= ms between
 // auto-published Observations (default 2500), ?name= a friendly label.
 //
+// To exercise the T2.1 fusion/dedup path, pin what gets published so two tabs
+// report the SAME target (the app then fuses them into one canonical ×2 track):
+//   ?target=ABC123   fixed target id (default: a fresh random "SIM###" each time)
+//   ?range=50000     include range_m (metres) so the look can be placed in world
+//                    space (default: omitted → the receiver falls back to az/el)
+//   ?az= / ?el=      pin the bearing/elevation (default: random each publish)
+//
 // It imports the mesh from ../src/mesh/ (ADR-0003's bundle path; Vite rewrites
 // the relative path to a /@fs/… URL), so run it under `npm run dev` and open
 // http://localhost:5173/mesh-sim.html — not from the raw static docs/ serve,
@@ -29,6 +36,12 @@ const TOPIC = params.get("topic") || "sky";
 const BUS = params.get("bus") || "skygraph";
 const RATE_MS = Math.max(250, Number(params.get("rate")) || 2500);
 const LABEL = params.get("name") || "";
+// Optional T2.1 pins (see header): make publishes deterministic so two tabs can
+// corroborate one target. Each is null/"" when absent → keep the random default.
+const FIXED_TARGET = params.get("target") || "";
+const FIXED_RANGE = params.has("range") ? Number(params.get("range")) : null;
+const FIXED_AZ = params.has("az") ? Number(params.get("az")) : null;
+const FIXED_EL = params.has("el") ? Number(params.get("el")) : null;
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -56,18 +69,17 @@ function logLine(msg) {
 // nodes would derive these from ADS-B; here they're invented so peers have
 // something to exchange.
 async function makeObservation() {
-  const target = "SIM" + Math.floor(100 + Math.random() * 900);
-  return sign(
-    {
-      kind: "aircraft",
-      target,
-      t: Math.floor(Date.now() / 1000),
-      az: +(Math.random() * 360).toFixed(1),
-      el: +(Math.random() * 90).toFixed(1),
-      obsCell: OBS_CELL,
-    },
-    identity,
-  );
+  const target = FIXED_TARGET || "SIM" + Math.floor(100 + Math.random() * 900);
+  const draft = {
+    kind: "aircraft",
+    target,
+    t: Math.floor(Date.now() / 1000),
+    az: FIXED_AZ != null && Number.isFinite(FIXED_AZ) ? FIXED_AZ : +(Math.random() * 360).toFixed(1),
+    el: FIXED_EL != null && Number.isFinite(FIXED_EL) ? FIXED_EL : +(Math.random() * 90).toFixed(1),
+    obsCell: OBS_CELL,
+  };
+  if (FIXED_RANGE != null && Number.isFinite(FIXED_RANGE)) draft.range_m = FIXED_RANGE;
+  return sign(draft, identity);
 }
 
 async function publishOne() {

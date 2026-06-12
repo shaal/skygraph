@@ -20,6 +20,7 @@
 import { createTransport } from "../src/mesh/transport.js";
 import { coarseCell, createIdentity, sign } from "../src/mesh/observation.js";
 import { NetworkTrackStore } from "../src/mesh/network-store.js";
+import { canonicalizeTracks } from "../src/mesh/fusion.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -85,6 +86,13 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // The network sky for rendering: each NetworkTrack exposes `latest()`
     // (freshest peer look: az/el/range_m/payload) and `sourceCount`.
     remoteTracks: () => store.tracks(),
+    // The fused network sky (T2.1): one canonical track per target, geometry
+    // reconciled from every source via their coarse cells and reprojected into
+    // THIS observer's frame for rendering. Each carries `sourceCount` (how many
+    // nodes corroborate it), `fused`, `position` (world ECEF), and per-source
+    // `residuals`. Pass the local observer so peers' tracks land where they
+    // actually are in our sky, not at the peers' own (to us, meaningless) az/el.
+    canonicalTracks: () => canonicalizeTracks(store.tracks(), { observer }),
     remoteCount: () => store.size,
     publish,
     prune: () => store.prune(),

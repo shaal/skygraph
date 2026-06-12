@@ -596,8 +596,8 @@ async function main() {
       moonBody = { az: moon.az, el: moon.el, visible: moon.el > -0.8 };
     }
     const remoteList = [];
-    for (const [, o] of remoteLooks()) {
-      if (o.el > 0) remoteList.push({ az: o.az, el: o.el, range: o.range_m });
+    for (const v of remoteViews()) {
+      if (v.el > 0) remoteList.push({ az: v.az, el: v.el, range: v.range_m });
     }
     sky3d.update({ aircraft: acList, sats: satList, remote: remoteList, sun: sunBody, moon: moonBody, showLabels: CFG.labels });
     sky3d.render();
@@ -614,11 +614,15 @@ async function main() {
     drawSkyDome(ctx, w, h);
     if (CFG.sunmoon) drawSunMoon(w, h);
     // Network sky underneath the local layer: peers' rings frame, but never
-    // hide, this node's own filled dots.
-    for (const [, o] of remoteLooks()) {
+    // hide, this node's own filled dots. One ring per canonical target, badged
+    // with its ×N sources count when multiple nodes corroborate it (T2.1).
+    for (const v of remoteViews()) {
       // Label with the peer-supplied callsign only (no raw target ids) and only
       // when labels are on, to keep a busy network sky legible.
-      drawNetworkTrack(ctx, o, w, h, CFG.labels ? (o.payload?.call || null) : null);
+      drawNetworkTrack(ctx, v, w, h, {
+        label: CFG.labels ? (v.payload?.call || null) : null,
+        sources: v.sourceCount,
+      });
     }
     const tracks = replay.active ? replay.tracks : feed.trackList;
     if (CFG.aircraft) {
@@ -678,16 +682,13 @@ async function main() {
     return out;
   }
 
-  // The remote tracks to draw, as [track, latest-observation] pairs, freshest
-  // look first. Empty unless the network sky is on and the mesh loaded.
-  function remoteLooks() {
+  // The remote tracks to draw, as fused canonical tracks (T2.1): one per target,
+  // geometry reconciled across all sources via their coarse cells and reprojected
+  // into our frame. Each view carries { az, el, range_m, kind, payload,
+  // sourceCount }. Empty unless the network sky is on and the mesh loaded.
+  function remoteViews() {
     if (!CFG.networkSky || !mesh) return [];
-    const looks = [];
-    for (const tr of mesh.remoteTracks()) {
-      const o = tr.latest();
-      if (o) looks.push([tr, o]);
-    }
-    return looks;
+    return mesh.canonicalTracks();
   }
 
   // --- Render loop ---------------------------------------------------------------
