@@ -382,6 +382,10 @@ async function main() {
     // fresh rUv credit — the headline count for the leaderboard. 0 only on a solo
     // idle node, so the segment is live once the mesh is participating.
     const ruvNodes = mesh.ruvContributors ? mesh.ruvContributors() : 0;
+    // Spoofer slashing (T4.3): how many distinct nodes the network has blocklisted —
+    // k+ signed misbehavior reports agree, so their looks are excluded from the fuse
+    // entirely. 0 in a healthy mesh, so the segment stays hidden.
+    const slashed = mesh.slashedNodes ? mesh.slashedNodes() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
@@ -391,6 +395,7 @@ async function main() {
       (fedNodes ? ` · model ${fedNodes}n` : "") +
       (rfZones ? ` · RF ${rfZones} zone${rfZones === 1 ? "" : "s"}` : "") +
       (distrusted ? ` · ⚑ ${distrusted} distrusted` : "") +
+      (slashed ? ` · ⛔ ${slashed} slashed` : "") +
       (ruvNodes ? ` · ⊕ rUv ${ruvNodes}n` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
@@ -619,6 +624,10 @@ async function main() {
           // network sky. Set before the position guard below so it shows even for a
           // track with no local position fix this frame.
           tr.fusionTrust = canon.get(tr.icao24)?.fusionTrust ?? null;
+          // Slashing (T4.3): how many of this target's source nodes the mesh has
+          // blocklisted and excluded from the fuse — for the detail panel. 0/absent ⇒
+          // no slashed source, so the panel line stays hidden.
+          tr.slashedSources = canon.get(tr.icao24)?.slashedSources ?? 0;
           const p = tr.points.length ? tr.points[tr.points.length - 1] : null;
           if (!p || !Number.isFinite(p.lat) || !Number.isFinite(p.lon)) continue;
           const info = mesh.localRf({ lat: p.lat, lon: p.lon, az: p.az, el: p.el, fused: canon.get(tr.icao24) }, nowSec);

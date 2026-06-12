@@ -29,6 +29,7 @@ import { FederatedAnomalyModel } from "../src/mesh/fedmodel.js";
 import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
 import { ReputationLedger } from "../src/mesh/reputation.js";
 import { ContributionLedger } from "../src/mesh/ruv.js";
+import { SlashingLedger } from "../src/mesh/slashing.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -110,6 +111,18 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // (coarse obsCell + nodeId + t — ADR-0007); like reputation it's derived locally
   // and never gossiped, so every node computes the same board (coordinator-free).
   const ruv = new ContributionLedger();
+  // Spoofer slashing / network blocklist (T4.3, ADR-0008): every Observation that
+  // carries a node's signed misbehavior report (`payload.slash` = { node, reason? })
+  // — peers' AND our own publishes — becomes a report against the accused node, keyed
+  // by that nodeId; a node is "slashed" only once k distinct nodes report it. A slashed
+  // node is then IGNORED network-wide: `canonicalTracks` excludes its looks from the
+  // fuse via `excludeNode` below (a hard blocklist, beyond reputation's down-weighting),
+  // so a corroborated spoofer can no longer shape the network sky. Like reputation it's
+  // derived from already-on-the-wire fields and computed locally, so every node holding
+  // the same reports reaches the same blocklist (coordinator-free, ADR-0005); a
+  // malformed report is ignored by `ingest`. Sybil-hardening (weighting a report by the
+  // reporter's reputation) is the documented T4.1 follow-up.
+  const slashing = new SlashingLedger();
   // The time span (seconds) of a track's POSITIONED sources — the ones reputation
   // scores (those in `residuals`). Used to gate reputation on a co-temporal fuse
   // (see REP_CO_TEMPORAL_WINDOW_S). Infinity when the store has no such track.
@@ -150,6 +163,14 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
       model.ingest(obs);
     } catch { /* a hostile gradient never breaks ingest */ }
   }
+  function recordSlash(obs) {
+    // Like recordVote/recordRf: `ingest` is written not to throw, but this step has no
+    // internal error boundary the transport relies on, so guard it — a pathological
+    // `payload.slash` must never throw into onObservation and stop delivery.
+    try {
+      slashing.ingest(obs);
+    } catch { /* a hostile slash report never breaks ingest */ }
+  }
   function recordVote(obs) {
     // Like `rememberEmbedding`, this ingest step has no internal error boundary
     // we rely on, so guard it: a pathological payload must never throw into the
@@ -182,7 +203,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // + freshness) flow straight into the network store, keyed by target — into the
   // provenance DAG for tamper-evident first-seen, and into the shared novelty
   // memory if they carry a §13 embedding.
-  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); recordRf(obs); recordRuv(obs); });
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); recordRf(obs); recordRuv(obs); recordSlash(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -229,6 +250,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         recordGradient(r.value); // our own model update is one of the aggregated contributors
         recordRf(r.value); // our own RF-anomaly flag is one of the corroborating votes
         recordRuv(r.value); // our own participation earns this node rUv too (T4.2)
+        recordSlash(r.value); // our own misbehavior report is one of the corroborating reports (T4.3)
 
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
@@ -262,6 +284,12 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
       const tracks = canonicalizeTracks(store.tracks(), {
         observer,
         weightFor: (nodeId) => reputation.weight(nodeId, nowT),
+        // T4.3 slashing: a node k+ peers have reported as misbehaving is IGNORED — its
+        // looks are dropped from the fuse entirely (not just down-weighted), so a
+        // corroborated spoofer can't shape the canonical sky, and a target seen ONLY by
+        // slashed nodes disappears. Every node computes the same verdict, so the
+        // exclusion is identical network-wide (coordinator-free).
+        excludeNode: (nodeId) => slashing.isSlashed(nodeId, nowT),
       });
       for (const tr of tracks) {
         // Attach the DAG-backed first-seen provenance so the UI can show "first
@@ -285,6 +313,14 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
           reputation.observeTrack({ target: tr.target, t: tr.lastSeen, residuals: tr.residuals });
         }
         tr.fusionTrust = reputation.trackTrust(tr.residuals, nowT);
+        // Slashing (T4.3): how many of THIS target's source nodes are currently slashed
+        // — and thus were just excluded from the fuse above (`tr.nodeIds` no longer lists
+        // them). Lets the panel flag a track whose network sky was cleaned of a
+        // blocklisted spoofer. 0 in the healthy case (the line stays hidden).
+        const st = store.get(tr.target);
+        let slashedSources = 0;
+        if (st) for (const nid of st.nodeIds()) if (slashing.isSlashed(nid, nowT)) slashedSources++;
+        tr.slashedSources = slashedSources;
       }
       return tracks;
     },
@@ -398,6 +434,19 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     ruvContributors: (nowT = Math.floor(Date.now() / 1000)) => ruv.leaderboard(nowT).totals.nodes,
     // rUv ledger roll-up for diagnostics/tests.
     ruvStats: () => ({ nodes: ruv.size, ...ruv.stats }),
+    // Spoofer slashing (T4.3, ADR-0008). Is this node currently blocklisted — k+
+    // distinct nodes have signed a misbehavior report against it? The enforcement
+    // predicate the canonical fuse uses to exclude a slashed node's looks.
+    isSlashed: (nodeId, nowT = Math.floor(Date.now() / 1000)) => slashing.isSlashed(nodeId, nowT),
+    // The slash verdict for one node — null if no node has reported it, else
+    // { node, reporters, slashed, k, reason } so a caller can show whether a node is
+    // blocklisted (k+ reporters) or merely under a single-node suspicion.
+    slashStatus: (nodeId, nowT = Math.floor(Date.now() / 1000)) => slashing.status(nodeId, { nowT }),
+    // How many distinct nodes are currently slashed (k+ reporters agree) — the headline
+    // "⛔ N slashed" count for the network-sky readout.
+    slashedNodes: (nowT = Math.floor(Date.now() / 1000)) => slashing.slashedCount(nowT),
+    // Slashing ledger roll-up for diagnostics/tests.
+    slashStats: () => ({ accused: slashing.size, ...slashing.stats }),
     // Edge detection for one of THIS node's live looks (T3.4). Folds the two reads
     // sky.js needs into one call so it never touches `src/mesh` or the coarse-cell
     // math directly: (1) the cell this aircraft is over and the network's RF verdict
@@ -429,7 +478,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // Age out stale state on the caller's cadence: the network store's sources AND
     // the consensus memory's votes (both keyed to the same freshness window, so a
     // target that drops off the sky also drops out of consensus).
-    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); reputation.prune(now); ruv.prune(now); return s; },
+    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); reputation.prune(now); ruv.prune(now); slashing.prune(now); return s; },
     // Cumulative transport + store counters, for diagnostics/tests.
     stats: () => ({ transport: transport.stats, store: store.stats }),
     dispose: () => { off(); transport.leave(); },

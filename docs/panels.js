@@ -134,6 +134,14 @@ export function renderDetails(v) {
     lines.push(`⚑ fused over ${ft.sources} node${ft.sources === 1 ? "" : "s"} · ` +
       `${ft.distrusted} down-weighted (lowest trust ${Math.round(ft.minRep * 100)}%) (mesh)`);
   }
+  // Spoofer slashing (T4.3): when this target's network track had source nodes the mesh
+  // has BLOCKLISTED (k+ signed misbehavior reports agree), say so — those looks were
+  // excluded from the fused position entirely, a hard blocklist beyond reputation's
+  // down-weighting. Absent/0 ⇒ no slashed source / no mesh, so the line simply doesn't show.
+  if (tr.slashedSources) {
+    lines.push(`⛔ ${tr.slashedSources} slashed source${tr.slashedSources === 1 ? "" : "s"} ` +
+      `excluded from the fuse (mesh)`);
+  }
   details.innerHTML = who +
     lines.map((l) => line(l, tr.emergency ? "#ff5252" : c)).join("");
 }

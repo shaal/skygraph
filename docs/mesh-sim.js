@@ -61,6 +61,19 @@ const RF_KIND = params.get("rf") || "";
 // and the app shows "⚑ 1 distrusted" with the spoofer's look pulled out of the fuse.
 const SPOOF = params.has("spoof");
 const SPOOF_DEG = params.has("spoofdeg") ? Number(params.get("spoofdeg")) : 90;
+// T4.3 slashing demo. `?slashtarget=<nodeId>` makes this tab a REPORTER: every publish
+// carries a signed `payload.slash` misbehavior report against that exact accused
+// nodeId. Once k (default 2) distinct reporter tabs name the SAME nodeId, the app's
+// SlashingLedger blocklists it network-wide and EXCLUDES its looks from the fused sky
+// (the readout shows "⛔ 1 slashed"). Copy the misbehaving node's full id from its
+// mesh-sim header (hover the `id` field for the full key) or from the app. `?slashreason=`
+// sets the reported category (default "spoof"). Pair it with a spoofer to see the fuse
+// snap back to the honest consensus once the spoofer is slashed:
+//   spoofer:  ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&range=50000&az=30&el=20&spoof
+//   reporter: ?bus=skygraph-edgenet&topic=all-sky&target=GHOST1&range=50000&az=30&el=20&slashtarget=<spoofer id>
+//   reporter: (a second tab, same slashtarget) — two reporters slash the spoofer.
+const SLASH_TARGET = params.get("slashtarget") || "";
+const SLASH_REASON = params.get("slashreason") || "spoof";
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -109,6 +122,11 @@ async function makeObservation() {
   if (RF_KIND === "spoof" || RF_KIND === "jam") {
     const cell = params.get("rfcell") || coarseCell(BASE.lat, BASE.lon);
     draft.payload = { ...(draft.payload || {}), rf: { kind: RF_KIND, cell, target } };
+  }
+  // T4.3: attach a signed misbehavior report against `?slashtarget` so this tab
+  // corroborates a blocklist. Carries only the accused nodeId + a reason (no location).
+  if (SLASH_TARGET) {
+    draft.payload = { ...(draft.payload || {}), slash: { node: SLASH_TARGET, reason: SLASH_REASON } };
   }
   return sign(draft, identity);
 }

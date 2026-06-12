@@ -114,6 +114,19 @@ function dist3(a, b) {
   return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 }
 
+// Freshest of a source list by the store's recency order (newer `t`; the smaller
+// nodeId breaks ties) — used when slashing (T4.3) has filtered out sources, so the
+// track's own cached `latest()` may itself be an excluded node. Mirrors network-
+// store's `moreRecent`, so the representative look stays the one the store would pick
+// over the SURVIVING sources, and the choice is deterministic / arrival-independent.
+function freshestSource(sources) {
+  let best = null;
+  for (const o of sources) {
+    if (!best || o.t > best.t || (o.t === best.t && o.nodeId < best.nodeId)) best = o;
+  }
+  return best;
+}
+
 /**
  * Reconcile one NetworkTrack into a CanonicalTrack.
  *
@@ -133,6 +146,16 @@ function dist3(a, b) {
  *        measured against the UNWEIGHTED median (the reputation-blind reference that
  *        scores reputation — see reputation.js). Omitted → the position is the plain
  *        component-median, byte-identical to before this option existed.
+ * @param {(nodeId:string)=>boolean} [opts.excludeNode]
+ *        optional hard blocklist predicate (T4.3, ADR-0008). A source whose nodeId it
+ *        accepts is IGNORED ENTIRELY — dropped from the fuse, the residuals, and the
+ *        provenance (`sourceCount`/`nodeIds`), not merely weighted to zero. This is the
+ *        spoofer-slashing kill switch, stronger than `weightFor`'s gradual down-
+ *        weighting: a slashed node neither pulls the position nor props up corroboration.
+ *        A track left with NO surviving source returns null (a target seen only by
+ *        slashed nodes vanishes — "ignored network-wide"). A throwing predicate fails
+ *        OPEN (keeps the source), so a buggy blocklist can't silently erase honest
+ *        nodes. Omitted (every pre-T4.3 caller) → no filtering, byte-identical to before.
  * @returns {object|null} CanonicalTrack, or null for an empty track:
  *   { target, kind, sourceCount, nodeIds, lastSeen, payload,
  *     fused,        // true when a world position was reconstructed from ≥1 ranged source
@@ -141,11 +164,29 @@ function dist3(a, b) {
  *                                // fused track when no observer was supplied)
  *     residuals }                // Map<nodeId, metres from that source's world pos to canonical>
  */
-export function canonicalizeTrack(track, { observer, weightFor } = {}) {
-  const sources = track.observations();
-  if (!sources.length) return null;
-  const latest = track.latest();
-  if (!latest) return null; // defensive: a non-empty track must have a representative
+export function canonicalizeTrack(track, { observer, weightFor, excludeNode } = {}) {
+  const allSources = track.observations();
+  if (!allSources.length) return null;
+  // T4.3 slashing: a slashed node is IGNORED — its looks are dropped from the fuse
+  // entirely (not merely weighted to zero), so it neither pulls the canonical position
+  // nor props up corroboration. A throwing predicate fails OPEN (keeps the source), so
+  // a buggy/hostile blocklist can only ever silence — never silently erase honest
+  // nodes. When it filters nothing (every pre-T4.3 caller), `sources === allSources`
+  // and the function behaves exactly as before, byte for byte.
+  const sources = typeof excludeNode === "function"
+    ? allSources.filter((o) => { try { return !excludeNode(o.nodeId); } catch { return true; } })
+    : allSources;
+  if (!sources.length) return null; // every source slashed → the track is ignored entirely
+  // When sources were filtered the track's cached latest / sourceCount / nodeIds may
+  // count an excluded node, so recompute them over the SURVIVORS; otherwise use the
+  // track's own (unchanged) view so the no-blocklist path stays identical.
+  const filtered = sources.length !== allSources.length;
+  const latest = filtered ? freshestSource(sources) : track.latest();
+  if (!latest) return null; // defensive: a non-empty source set must have a representative
+  const sourceCount = filtered ? sources.length : track.sourceCount;
+  const nodeIds = filtered ? sources.map((o) => o.nodeId) : track.nodeIds();
+  const kind = filtered ? latest.kind : track.kind;
+  const lastSeen = filtered ? latest.t : track.lastSeen;
 
   // Lift every source that carries a usable, finite look + range into world
   // space, standing the observer at its decoded coarse-cell centre (no altitude
@@ -201,10 +242,10 @@ export function canonicalizeTrack(track, { observer, weightFor } = {}) {
 
   return {
     target: track.target,
-    kind: track.kind,
-    sourceCount: track.sourceCount,
-    nodeIds: track.nodeIds(),
-    lastSeen: track.lastSeen,
+    kind,
+    sourceCount,
+    nodeIds,
+    lastSeen,
     payload: latest.payload ?? null,
     fused,
     position,
