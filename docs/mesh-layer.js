@@ -22,6 +22,7 @@ import { coarseCell, createIdentity, sign } from "../src/mesh/observation.js";
 import { NetworkTrackStore } from "../src/mesh/network-store.js";
 import { canonicalizeTracks } from "../src/mesh/fusion.js";
 import { buildCoverage } from "../src/mesh/coverage.js";
+import { ProvenanceDag } from "../src/mesh/dag.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -44,10 +45,24 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
 
   const transport = createTransport({ kind, nodeId: identity.nodeId, busId });
   const store = new NetworkTrackStore();
+  // The provenance DAG (T2.4): a durable, content-addressed record of every
+  // Observation this node ingests, so "first seen by node X at T" survives the
+  // store's TTL pruning and stays independently verifiable (ADR-0005 §3). The
+  // anchor runs alongside the store ingest on the same already-verified feed.
+  const dag = new ProvenanceDag();
+  // DAG anchoring is async (a SHA-256 content hash); fire-and-forget on the live
+  // path so ingest never blocks, but track in-flight anchors so tests (and any
+  // caller that needs a settled view) can await them. `anchor` never rejects.
+  const pendingAnchors = new Set();
+  function anchor(obs) {
+    const p = dag.anchor(obs).catch(() => {}).finally(() => pendingAnchors.delete(p));
+    pendingAnchors.add(p);
+  }
   transport.join(topic);
   // Verified, fresh peer Observations (the transport already checked signature
-  // + freshness) flow straight into the network store, keyed by target.
-  const off = transport.onObservation((obs) => store.ingest(obs));
+  // + freshness) flow straight into the network store, keyed by target — and into
+  // the provenance DAG for tamper-evident first-seen.
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -70,6 +85,10 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
       let sent = 0;
       for (const r of signed) {
         if (r.status !== "fulfilled") continue;
+        // Anchor our own sightings too: the network's first-seen for a target may
+        // well be us (peers don't echo our publishes back, so this is the only
+        // path our own looks reach the DAG).
+        anchor(r.value);
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
       return sent;
@@ -93,7 +112,15 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // nodes corroborate it), `fused`, `position` (world ECEF), and per-source
     // `residuals`. Pass the local observer so peers' tracks land where they
     // actually are in our sky, not at the peers' own (to us, meaningless) az/el.
-    canonicalTracks: () => canonicalizeTracks(store.tracks(), { observer }),
+    canonicalTracks: () => {
+      const tracks = canonicalizeTracks(store.tracks(), { observer });
+      // Attach the DAG-backed first-seen provenance so the UI can show "first
+      // seen by node X at T" on each network track without a second pass (T2.4).
+      // Null until the async anchor for a brand-new target has settled (the UI
+      // simply omits provenance for that one frame).
+      for (const tr of tracks) tr.provenance = dag.firstSeen(tr.target);
+      return tracks;
+    },
     // The coverage picture for the "where does the network have eyes?" heatmap
     // (T2.2): every peer Observation's coarse cell + this node's own cell, folded
     // into per-cell density + an N×N gap grid. `localObsCount` is how many local
@@ -118,6 +145,21 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
       return cov;
     },
     remoteCount: () => store.size,
+    // Provenance (T2.4): full tamper-evident history for one target — the durable
+    // first-seen plus the deterministically-ordered chain of update vertices.
+    provenance: (target) => dag.provenance(target),
+    // Re-derive a target's first-seen content address and re-check the
+    // originator's signature — the on-demand "is this provenance genuine?" proof.
+    // Resolves false when the target is unknown or the vertex fails either check.
+    verifyProvenance: async (target) => {
+      const fs = dag.firstSeen(target);
+      return fs ? dag.verifyVertex(fs.vertexId) : false;
+    },
+    // Roll-up for the network-sky readout / diagnostics.
+    dagStats: () => ({ vertices: dag.size, targets: dag.targetCount, ...dag.stats }),
+    // Await all in-flight DAG anchors (anchoring is async on the live path).
+    // Lets a caller read a settled provenance view right after publishing.
+    idle: () => Promise.all([...pendingAnchors]),
     publish,
     prune: () => store.prune(),
     // Cumulative transport + store counters, for diagnostics/tests.

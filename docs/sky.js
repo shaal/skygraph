@@ -339,9 +339,13 @@ async function main() {
     if (!mesh) return;
     const nodes = mesh.nodeCount();
     const remote = mesh.remoteCount();
+    // Provenance roll-up (T2.4): how many tamper-evident vertices the local DAG
+    // currently anchors — shows the "first seen by X at T" record is live.
+    const dag = mesh.dagStats ? mesh.dagStats() : { vertices: 0 };
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
+      (dag.vertices ? ` · DAG ${dag.vertices} vtx` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -629,11 +633,14 @@ async function main() {
     // Network sky underneath the local layer: peers' rings frame, but never
     // hide, this node's own filled dots. One ring per canonical target, badged
     // with its ×N sources count when multiple nodes corroborate it (T2.1).
+    const nowSec = Math.floor(Date.now() / 1000);
     for (const v of remoteViews()) {
-      // Label with the peer-supplied callsign only (no raw target ids) and only
-      // when labels are on, to keep a busy network sky legible.
+      // Label with the peer-supplied callsign plus the DAG-backed provenance
+      // (T2.4) — "first seen by node X at T", shown as the first-seer's short
+      // nodeId and the age of that first sighting. Only when labels are on, and
+      // never the raw target id, to keep a busy network sky legible.
       drawNetworkTrack(ctx, v, w, h, {
-        label: CFG.labels ? (v.payload?.call || null) : null,
+        label: CFG.labels ? networkLabel(v, nowSec) : null,
         sources: v.sourceCount,
       });
     }
@@ -704,6 +711,21 @@ async function main() {
   function remoteViews() {
     if (!CFG.networkSky || !mesh) return [];
     return mesh.canonicalTracks();
+  }
+
+  // The on-dome label for a network track: the public callsign (when present)
+  // followed by its DAG-backed provenance (T2.4) — "1st <node> <age>s", i.e. the
+  // node that first saw this target and how long ago. nodeId is a public key
+  // (already on the wire), shortened to its last 5 base58 chars for legibility;
+  // raw target ids are never shown. Returns null when there's nothing to label.
+  function networkLabel(v, nowSec) {
+    const call = v.payload?.call || null;
+    const prov = v.provenance;
+    if (!prov) return call; // anchor not settled yet — callsign only (or nothing)
+    const who = String(prov.nodeId).slice(-5);
+    const age = Math.max(0, nowSec - prov.t);
+    const tag = `1st ${who} ${age}s`;
+    return call ? `${call} · ${tag}` : tag;
   }
 
   // --- Render loop ---------------------------------------------------------------
