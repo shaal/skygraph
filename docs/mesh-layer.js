@@ -25,6 +25,7 @@ import { buildCoverage } from "../src/mesh/coverage.js";
 import { ProvenanceDag } from "../src/mesh/dag.js";
 import { SharedNoveltyMemory } from "../src/mesh/shared-novelty.js";
 import { AnomalyConsensus } from "../src/mesh/consensus.js";
+import { FederatedAnomalyModel } from "../src/mesh/fedmodel.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -66,6 +67,22 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // §15's single-node "local alert" gains network corroboration (ADR-0006). Reads
   // only the public target/nodeId/score; a malformed vote is ignored by `ingest`.
   const consensus = new AnomalyConsensus();
+  // Federated anomaly model (T3.3): a tiny linear adapter over the §13 embedding,
+  // trained LOCALLY on this node's own (embedding, §15-label) pairs and improved
+  // across the network by gossiping only its TopK-sparsified weights (`payload.grad`)
+  // — never a raw observation (ADR-0006). Every peer's update folds in here, and the
+  // federated model is the Byzantine-robust (trimmed-mean) aggregate of all fresh
+  // contributors, recomputed identically on every node (coordinator-free).
+  const model = new FederatedAnomalyModel();
+  function recordGradient(obs) {
+    // Like recordVote/rememberEmbedding: `ingest` is written not to throw, but this
+    // step has no internal error boundary the transport relies on, so guard it — a
+    // pathological `payload.grad` must never throw into onObservation and stop
+    // delivery.
+    try {
+      model.ingest(obs);
+    } catch { /* a hostile gradient never breaks ingest */ }
+  }
   function recordVote(obs) {
     // Like `rememberEmbedding`, this ingest step has no internal error boundary
     // we rely on, so guard it: a pathological payload must never throw into the
@@ -98,7 +115,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // + freshness) flow straight into the network store, keyed by target — into the
   // provenance DAG for tamper-evident first-seen, and into the shared novelty
   // memory if they carry a §13 embedding.
-  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); });
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -115,8 +132,22 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     if (transport.peers().length === 0) return 0;   // nobody listening — don't sign
     publishing = true;
     try {
+      // Federated model (T3.3): refresh our local fit and ride its TopK-sparsified
+      // update on ONE observation this batch — the update is node-level, not
+      // per-target, so it only needs to ride once. Raw examples NEVER leave; only
+      // these few weights do. A bad fit must never block publishing the looks.
+      let toSign = drafts;
+      try {
+        model.train();
+        const grad = model.localUpdate();
+        if (grad) {
+          toSign = drafts.slice();
+          const d0 = toSign[0];
+          toSign[0] = { ...d0, payload: { ...(d0.payload || {}), grad } };
+        }
+      } catch { /* gradient is best-effort; the looks still publish */ }
       const signed = await Promise.allSettled(
-        drafts.map((d) => sign({ ...d, obsCell }, identity)),
+        toSign.map((d) => sign({ ...d, obsCell }, identity)),
       );
       let sent = 0;
       for (const r of signed) {
@@ -128,6 +159,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         anchor(r.value);
         rememberEmbedding(r.value);
         recordVote(r.value); // our own anomaly flag is one of the corroborating votes
+        recordGradient(r.value); // our own model update is one of the aggregated contributors
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
       return sent;
@@ -221,6 +253,20 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     confirmedAnomalies: (nowT = Math.floor(Date.now() / 1000)) => consensus.confirmedCount(nowT),
     // { confirmed, total } across all currently-flagged anomalies, for diagnostics.
     consensusSummary: (nowT = Math.floor(Date.now() / 1000)) => consensus.summary(nowT),
+    // Federated anomaly model (T3.3). Feed this node's own (embedding, §15-label)
+    // pairs so it can train a local adapter — `emb` is the 32-dim §13 embedding,
+    // `label` is 1 when this node's §15 band is alert-worthy, else 0. The raw pair
+    // stays in the model's local buffer and NEVER reaches the wire.
+    observeExample: (emb, label) => model.observe(emb, label),
+    // The federated anomaly probability for `emb` — sigmoid over the Byzantine-robust
+    // aggregate of every fresh contributor's model — or null when no node (including
+    // us) has contributed yet, so the caller can fall back to the §15 score.
+    federatedScore: (emb, nowT = Math.floor(Date.now() / 1000)) => model.score(emb, nowT),
+    // How many distinct nodes currently contribute a fresh update to the federated
+    // model — the headline count for the readout (our own publish counts as one).
+    fedContributors: (nowT = Math.floor(Date.now() / 1000)) => model.aggregate(nowT)?.contributors ?? 0,
+    // Model roll-up for diagnostics/tests.
+    modelStats: () => ({ contributors: model.contributorCount, examples: model.exampleCount, ...model.stats }),
     // Await all in-flight DAG anchors (anchoring is async on the live path).
     // Lets a caller read a settled provenance view right after publishing.
     idle: () => Promise.all([...pendingAnchors]),
@@ -228,7 +274,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // Age out stale state on the caller's cadence: the network store's sources AND
     // the consensus memory's votes (both keyed to the same freshness window, so a
     // target that drops off the sky also drops out of consensus).
-    prune: () => { const s = store.prune(); consensus.prune(Math.floor(Date.now() / 1000)); return s; },
+    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); return s; },
     // Cumulative transport + store counters, for diagnostics/tests.
     stats: () => ({ transport: transport.stats, store: store.stats }),
     dispose: () => { off(); transport.leave(); },

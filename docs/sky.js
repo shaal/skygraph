@@ -347,12 +347,16 @@ async function main() {
     // Confirmed anomalies (T3.2): how many anomalies k+ distinct nodes currently
     // agree on — the corroborated subset of all the local alerts on the network.
     const confirmed = mesh.confirmedAnomalies ? mesh.confirmedAnomalies() : 0;
+    // Federated model (T3.3): how many distinct nodes currently contribute a fresh
+    // update to the shared anomaly adapter (our own publish counts as one).
+    const fedNodes = mesh.fedContributors ? mesh.fedContributors() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
       (dag.vertices ? ` · DAG ${dag.vertices} vtx` : "") +
       (memSize ? ` · mem ${memSize} emb` : "") +
       (confirmed ? ` · ⚠ ${confirmed} confirmed` : "") +
+      (fedNodes ? ` · model ${fedNodes}n` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -490,6 +494,7 @@ async function main() {
       details, selected, selectedSat, satsAbove, satNames, sun,
       feed, spaceWx, noveltySize: novelty.size(), conflicts, requestRoute,
       globalNoveltySize: mesh ? mesh.noveltyMemorySize() : 0,
+      fedModelNodes: mesh ? mesh.fedContributors() : 0,
     });
   }
 
@@ -536,6 +541,25 @@ async function main() {
       }
     }
     scoreAll(scorer, f.trackList);            // §15 via wasm, novelty-bearing
+    // Federated anomaly model (T3.3): teach the network's shared adapter from THIS
+    // node's §15 verdicts — a local track whose band is alert-worthy is a positive
+    // example, else a negative — and read back the federated prediction (sigmoid over
+    // the Byzantine-robust aggregate of every node's model). Runs after scoreAll so
+    // tr.anomaly (the label) exists. The raw (embedding, label) pair stays in the
+    // model's local buffer; only its TopK weights are gossiped (mesh-layer publish),
+    // never an observation (ADR-0006: raw data never leaves a node). Null fedScore ⇒
+    // offline / no contributor yet → the panel shows only §15.
+    if (mesh) {
+      const nowSec = Math.floor(nowT);
+      for (const tr of f.trackList) {
+        if (!tr._emb || tr._emb.length !== 32) continue;
+        if (tr.anomaly) {
+          const label = tr.anomaly.band === "strong anomaly" || tr.anomaly.band === "rare" ? 1 : 0;
+          mesh.observeExample(tr._emb, label);
+        }
+        tr.fedScore = mesh.federatedScore(tr._emb, nowSec);
+      }
+    }
     detectBehaviors(f.trackList, nowT);       // HOLD / GRID / GO-AROUND / FORM
     conflicts = CFG.conflicts ? detectConflicts(f.trackList, nowT) : [];
     recorder.record(f.trackList, nowT);       // replay ring buffer (~1 h)

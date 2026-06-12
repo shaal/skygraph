@@ -106,6 +106,14 @@ export function renderDetails(v) {
       ? `⚠ confirmed anomaly · corroborated by ${con.voters} node${con.voters === 1 ? "" : "s"} (mesh)`
       : `anomaly unconfirmed · ${con.voters}/${con.k} nodes (mesh)`);
   }
+  // Federated anomaly model (T3.3): the prediction of a tiny linear adapter trained
+  // across the network on §13 embeddings → §15 labels, gossiped as TopK-sparsified
+  // weights and Byzantine-robustly aggregated. Present only when the network has
+  // contributed a model (absent ⇒ offline / no peers, so just §15 + novelty show).
+  if (typeof tr.fedScore === "number") {
+    lines.push(`federated anomaly ${tr.fedScore.toFixed(2)} — linear adapter over §13, ` +
+      `${v.fedModelNodes}-node model (mesh)`);
+  }
   details.innerHTML = who +
     lines.map((l) => line(l, tr.emergency ? "#ff5252" : c)).join("");
 }
