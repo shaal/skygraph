@@ -54,6 +54,13 @@ How the pieces map under Vite (see [`vite.config.js`](../vite.config.js)):
   which serves only `docs/`. So mesh features require the Vite path (they pull
   npm packages anyway, per ADR-0003). Their node-tests live in `docs/test/` so
   `npm test` picks them up.
+  - The **main app** (T1.4) keeps every mesh import behind one seam,
+    [`docs/mesh-layer.js`](./mesh-layer.js), loaded by `sky.js` via a dynamic
+    `import()` gated on `import.meta.env` (defined under Vite, `undefined` on the
+    no-build serve). So the network sky ("My sky / Network sky" toggle) lights up
+    under `npm run dev`/`build`, and the no-build deploy runs **local-only** with
+    the toggle degrading to "needs the built app" — the 2D dome and 3D view are
+    identical either way.
 
 ### Mesh simulator (T1.2)
 

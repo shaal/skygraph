@@ -6,7 +6,7 @@ export const SETTINGS_KEY = "skygraph-settings-v1";
 const DEFAULTS = {
   aircraft: true, satellites: true, sunmoon: true, trails: true, labels: true,
   conflicts: true, trailLen: 150, webgpuSats: false, tleGroup: "visual",
-  view3d: false,
+  view3d: false, networkSky: false,
 };
 
 export const CFG = (() => {

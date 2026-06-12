@@ -15,6 +15,11 @@ export const LIVE_COLOR = "#5aa9ff"; // unscored live tracks
 export const SAT_COLOR = "#cfd8ea";
 export const SAT_VISIBLE_COLOR = "#ffe08a"; // sunlit satellite, dark sky
 export const CONFLICT_COLOR = "#ff5252";
+// Network sky (T1.4): a peer's observation, drawn as a distinct violet ring so
+// it reads clearly against the local layer's filled dots — even when it frames
+// a target this node also sees. Keep in sync with COL.network in sky3d.js and
+// the #mesh-readout accent in index.html.
+export const NETWORK_COLOR = "#c77dff";
 export const LINGER_SECS = 20;     // dot stays this long after the last sample
 export const KT = 0.514444;        // m/s per knot
 
@@ -116,6 +121,32 @@ export function drawTrack(ctx, tr, t, w, h, selected, cfg) {
     ctx.fillText(`${tr.label}${arrow} ${Math.round(p.alt_m)}m`, x + 12, y - 6);
   }
   ctx.globalAlpha = 1;
+  return true;
+}
+
+// Draw one remote ("network sky") track from a peer's latest Observation — an
+// az/el look gossiped over the mesh (T1.4). Distinct violet ring + faint centre
+// so it stands apart from local filled dots and stays visible when it overlaps
+// one. `obs` is a frozen Observation ({ az, el, kind, payload }); `label`, when
+// given, is drawn alongside. Returns whether it landed above the horizon.
+export function drawNetworkTrack(ctx, obs, w, h, label) {
+  const [x, y, visible] = polarScreenXY(obs.az, obs.el, w, h);
+  if (!visible) return false;
+  ctx.save();
+  ctx.strokeStyle = NETWORK_COLOR;
+  ctx.fillStyle = NETWORK_COLOR;
+  const r = obs.kind === "satellite" ? 5 : 6.5;
+  ctx.lineWidth = 1.5;
+  ctx.globalAlpha = 0.9;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+  ctx.globalAlpha = 0.65;
+  ctx.beginPath(); ctx.arc(x, y, 1.5, 0, Math.PI * 2); ctx.fill();
+  if (label) {
+    ctx.globalAlpha = 0.9;
+    ctx.font = "10px monospace";
+    ctx.fillText(label, x + r + 3, y + 3);
+  }
+  ctx.restore();
   return true;
 }
 

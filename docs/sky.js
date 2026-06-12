@@ -17,7 +17,7 @@ import { LiveFeed, displayPoint, syncLiveTable } from "./live-feed.js";
 import { moonPosition, satSunlit, sunPosition } from "./astro.js";
 import { scoreAll } from "./score-live.js";
 import {
-  BAND_COLORS, drawConflictLine, drawCone, drawSkyDome, drawTrack,
+  BAND_COLORS, drawConflictLine, drawCone, drawNetworkTrack, drawSkyDome, drawTrack,
   LIVE_COLOR, SAT_COLOR, SAT_VISIBLE_COLOR,
 } from "./draw.js";
 import { CFG, initDrawer, saveSettings } from "./settings.js";
@@ -158,6 +158,23 @@ async function main() {
   const spaceWx = new SpaceWeather(() => showDetails());
   spaceWx.start();
 
+  // --- Mesh / network sky (T1.4) ----------------------------------------------
+  // EdgeNet's network sky lives in ./mesh-layer.js, which imports ../src/mesh
+  // (outside the Vite root). That resolves only under the bundler, so we load it
+  // via a guarded dynamic import gated on `import.meta.env` — defined under
+  // `npm run dev`/`build`, undefined on the no-build static serve. On the static
+  // deploy `mesh` stays null and the network sky is simply unavailable; the
+  // local 2D dome and 3D view are untouched (DEV.md §2, ADR-0002/0003).
+  let mesh = null;
+  if (import.meta.env) {
+    try {
+      const { startMeshLayer } = await import("./mesh-layer.js");
+      mesh = await startMeshLayer({ observer: OBSERVER });
+    } catch (e) {
+      console.warn("[edgenet] network sky unavailable:", e?.message || e);
+    }
+  }
+
   // --- Satellite layer (wasm SGP4; stays off without ./pkg) -------------------
   let satProp = null, satNames = [], satsAbove = [], passes = null;
   let satGen = 0;
@@ -292,6 +309,44 @@ async function main() {
   view2dBtn.addEventListener("click", () => applyView(false));
   syncViewToggle(CFG.view3d);
   if (CFG.view3d) applyView(true); // restore 3D from a previous session
+
+  // On-screen "My sky / Network sky" switch (top-left), mirroring the 2D/3D
+  // control. "Network sky" overlays peers' tracks on top of the local view
+  // (never replaces it); the readout under it reports peers + remote tracks.
+  // When the mesh layer didn't load (static serve), the control degrades: the
+  // button bounces back and the readout says how to get it.
+  const skyMineBtn = document.getElementById("sky-mine");
+  const skyNetBtn = document.getElementById("sky-net");
+  const meshReadout = document.getElementById("mesh-readout");
+  function setSkyButtons(on) {
+    skyNetBtn.classList.toggle("on", on);
+    skyMineBtn.classList.toggle("on", !on);
+  }
+  function updateMeshReadout() {
+    if (!mesh) return;
+    const nodes = mesh.nodeCount();
+    const remote = mesh.remoteCount();
+    meshReadout.textContent =
+      `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
+      `${remote} remote track${remote === 1 ? "" : "s"}` +
+      (nodes === 1 ? " · open another tab to mesh" : "");
+  }
+  function applySky(on) {
+    if (on && !mesh) { // network sky needs the bundled app — degrade gracefully
+      setSkyButtons(false);
+      meshReadout.hidden = false;
+      meshReadout.textContent = "Network sky needs the built app (npm run dev/build)";
+      return;
+    }
+    CFG.networkSky = on;
+    saveSettings();
+    setSkyButtons(on);
+    meshReadout.hidden = !on;
+    if (on) updateMeshReadout();
+  }
+  skyNetBtn.addEventListener("click", () => applySky(true));
+  skyMineBtn.addEventListener("click", () => applySky(false));
+  applySky(CFG.networkSky && !!mesh); // restore (only if the mesh actually loaded)
 
   loadSats(CFG.tleGroup);
 
@@ -540,7 +595,11 @@ async function main() {
       const moon = moonPosition(t, OBSERVER.lat, OBSERVER.lon);
       moonBody = { az: moon.az, el: moon.el, visible: moon.el > -0.8 };
     }
-    sky3d.update({ aircraft: acList, sats: satList, sun: sunBody, moon: moonBody, showLabels: CFG.labels });
+    const remoteList = [];
+    for (const [, o] of remoteLooks()) {
+      if (o.el > 0) remoteList.push({ az: o.az, el: o.el, range: o.range_m });
+    }
+    sky3d.update({ aircraft: acList, sats: satList, remote: remoteList, sun: sunBody, moon: moonBody, showLabels: CFG.labels });
     sky3d.render();
   }
 
@@ -554,6 +613,13 @@ async function main() {
     ctx.clearRect(0, 0, w, h);
     drawSkyDome(ctx, w, h);
     if (CFG.sunmoon) drawSunMoon(w, h);
+    // Network sky underneath the local layer: peers' rings frame, but never
+    // hide, this node's own filled dots.
+    for (const [, o] of remoteLooks()) {
+      // Label with the peer-supplied callsign only (no raw target ids) and only
+      // when labels are on, to keep a busy network sky legible.
+      drawNetworkTrack(ctx, o, w, h, CFG.labels ? (o.payload?.call || null) : null);
+    }
     const tracks = replay.active ? replay.tracks : feed.trackList;
     if (CFG.aircraft) {
       for (const tr of tracks) {
@@ -588,6 +654,40 @@ async function main() {
       satsAbove = [];
       if (gpu) gpu.draw(gpuInst, 0, w, h, dpr); // clear the overlay
     }
+  }
+
+  // Build the signed-Observation drafts for what this node sees right now: its
+  // live aircraft, at their current (dead-reckoned) az/el, above the horizon.
+  // The mesh layer adds the coarse cell + signature; we only ever hand it az/el
+  // (never raw coordinates). Empty during replay — we don't gossip past traffic.
+  function localObservations(nowSec) {
+    const out = [];
+    if (replay.active || !CFG.aircraft) return out;
+    for (const tr of feed.trackList) {
+      if (!tr.points.length || !tr.icao24) continue;
+      const p = tr._ghost || tr.points[tr.points.length - 1];
+      if (!p || p.az === undefined || !(p.el > 0)) continue;
+      const d = { kind: "aircraft", target: tr.icao24, t: nowSec, az: p.az, el: p.el };
+      if (Number.isFinite(p.range)) d.range_m = p.range;
+      // payload carries only the public callsign — never any location data
+      // (ADR-0007: the coarse obsCell, added in mesh-layer.js, is the only place
+      // the observer's whereabouts may appear on the wire).
+      if (tr.label) d.payload = { call: String(tr.label).slice(0, 16) };
+      out.push(d);
+    }
+    return out;
+  }
+
+  // The remote tracks to draw, as [track, latest-observation] pairs, freshest
+  // look first. Empty unless the network sky is on and the mesh loaded.
+  function remoteLooks() {
+    if (!CFG.networkSky || !mesh) return [];
+    const looks = [];
+    for (const tr of mesh.remoteTracks()) {
+      const o = tr.latest();
+      if (o) looks.push([tr, o]);
+    }
+    return looks;
   }
 
   // --- Render loop ---------------------------------------------------------------
@@ -627,6 +727,26 @@ async function main() {
   }
 
   window.addEventListener("resize", render);
+  // Mesh tick on a steady 1 Hz timer — deliberately NOT the rAF loop. A
+  // backgrounded tab throttles/pauses requestAnimationFrame, but the mesh keeps
+  // delivering peer Observations into the store; pruning off a timer keeps the
+  // store bounded regardless of visibility. We only publish while visible (a
+  // hidden tab's dead-reckoned positions are stale) and never during replay.
+  if (mesh) {
+    setInterval(() => {
+      mesh.prune();
+      if (!replay.active && !document.hidden) {
+        mesh.publish(localObservations(Math.floor(Date.now() / 1000))).catch(() => {});
+      }
+      if (CFG.networkSky) updateMeshReadout();
+    }, 1000);
+    // Announce departure so peers' "N nodes online" reacts promptly to this tab
+    // closing. beforeunload misses mobile/bfcache; pagehide covers those. leave()
+    // is idempotent, so firing both is harmless.
+    const leaveMesh = () => mesh.dispose();
+    window.addEventListener("beforeunload", leaveMesh);
+    window.addEventListener("pagehide", leaveMesh);
+  }
   requestAnimationFrame(tick);
 }
 

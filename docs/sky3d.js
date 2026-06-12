@@ -18,6 +18,7 @@ const COL = {
   grid: 0x1b2440, ring: 0x2a3a63, ringMajor: 0x3a4f86, text: 0x6b7896,
   sun: 0xffd75e, moon: 0xdde4f2, sat: 0x6f7fb0, satVisible: 0x8affc1,
   aircraft: 0x5aa9ff, selected: 0xffffff, drop: 0x5aa9ff,
+  network: 0xc77dff, // peers' "network sky" tracks (T1.4); matches NETWORK_COLOR in draw.js
 };
 
 // az (deg, 0 = North, clockwise) + el (deg, 0 = horizon, 90 = zenith) -> a
@@ -75,7 +76,7 @@ export class Sky3D {
   constructor() {
     this.ready = false;
     this._tmp = new THREE.Vector3();
-    this._pick = { aircraft: [], sats: [] }; // world positions + refs for click picking
+    this._pick = { aircraft: [], sats: [], remote: [] }; // world positions + refs for click picking
     this._labels = [];                        // pooled label sprites
     this._onSelectAircraft = null;
     this._onSelectSat = null;
@@ -114,6 +115,8 @@ export class Sky3D {
     this._disc = discTexture();
     this._sats = this._makePoints(2.6);
     this._aircraft = this._makePoints(4.2);
+    this._remote = this._makePoints(5.0); // network-sky tracks, slightly larger + violet
+
     this._sun = this._makeGlow(COL.sun, 6);
     this._moon = this._makeGlow(COL.moon, 4.5);
     this._drop = this._makeDropLine();
@@ -199,16 +202,19 @@ export class Sky3D {
   }
 
   // --- per-frame update ------------------------------------------------------
-  update({ aircraft = [], sats = [], sun, moon, showLabels = false } = {}) {
+  update({ aircraft = [], sats = [], remote = [], sun, moon, showLabels = false } = {}) {
     if (!this.ready) return;
     this._pick.aircraft.length = 0;
     this._pick.sats.length = 0;
+    this._pick.remote.length = 0;
     let selPos = null;
 
     selPos = this._fillPoints(this._sats, sats, this._pick.sats,
       (s) => (s.selected ? COL.selected : s.visibleNow ? COL.satVisible : COL.sat), selPos) || selPos;
     selPos = this._fillPoints(this._aircraft, aircraft, this._pick.aircraft,
       (a) => (a.selected ? COL.selected : a.color ?? COL.aircraft), selPos) || selPos;
+    // Network sky: peers' tracks, display-only (not picked, no drop line).
+    this._fillPoints(this._remote, remote, this._pick.remote, () => COL.network, null);
 
     // Sun & moon ride on the dome shell.
     this._placeGlow(this._sun, sun);

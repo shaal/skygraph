@@ -52,18 +52,31 @@
            border: 1px solid var(--panel-edge); }
   body.view-3d #sky, body.view-3d #sky-gpu { display: none; }
   body.view-3d #sky3d { display: block; }
-  /* On-screen 2D/3D switch, top-right of the sky view. */
-  #view-toggle {
-    position: absolute; top: 10px; right: 10px; z-index: 5; display: flex;
+  /* On-screen 2D/3D switch (top-right) and My-sky/Network-sky switch
+     (top-left) — same pill styling, mirrored controls. */
+  #view-toggle, #sky-toggle {
+    position: absolute; top: 10px; z-index: 5; display: flex;
     background: rgba(13, 18, 32, 0.78); border: 1px solid var(--panel-edge);
     border-radius: 8px; padding: 2px; gap: 2px; backdrop-filter: blur(3px);
   }
-  #view-toggle button {
+  #view-toggle { right: 10px; }
+  #sky-toggle { left: 10px; }
+  #view-toggle button, #sky-toggle button {
     background: transparent; color: var(--ink-dim); border: 0; cursor: pointer;
     font: 600 12px/1 inherit; padding: 5px 12px; border-radius: 6px; letter-spacing: 0.04em;
   }
-  #view-toggle button:hover { color: #e8eefc; }
-  #view-toggle button.on { background: var(--accent); color: #07111f; }
+  #view-toggle button:hover, #sky-toggle button:hover { color: #e8eefc; }
+  #view-toggle button.on, #sky-toggle button.on { background: var(--accent); color: #07111f; }
+  /* Peer/coverage readout, under the network-sky switch. The accent (#c77dff)
+     matches NETWORK_COLOR in draw.js / COL.network in sky3d.js. */
+  #mesh-readout {
+    position: absolute; top: 44px; left: 10px; z-index: 5; max-width: 240px;
+    font: 600 11px/1.3 inherit; color: var(--ink-dim);
+    background: rgba(13, 18, 32, 0.7); border: 1px solid var(--panel-edge);
+    border-left: 3px solid #c77dff; border-radius: 6px; padding: 4px 8px;
+    backdrop-filter: blur(3px);
+  }
+  #mesh-readout[hidden] { display: none; }
   aside {
     flex: 0 0 360px; max-width: 40%; overflow-y: auto;
     background: var(--panel); border: 1px solid var(--panel-edge);
@@ -141,6 +154,11 @@
         <button id="view-2d" class="on" title="Flat all-sky dome">2D</button>
         <button id="view-3d" title="Orbit &amp; zoom the sky in 3D space">3D</button>
       </div>
+      <div id="sky-toggle" role="group" aria-label="Sky layer">
+        <button id="sky-mine" class="on" title="Only this node's own observations">My sky</button>
+        <button id="sky-net" title="Overlay aircraft gossiped by mesh peers (EdgeNet)">Network sky</button>
+      </div>
+      <div id="mesh-readout" hidden></div>
     </div>
     <aside>
       <h2>Track details</h2>
