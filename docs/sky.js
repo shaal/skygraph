@@ -344,11 +344,15 @@ async function main() {
     const dag = mesh.dagStats ? mesh.dagStats() : { vertices: 0 };
     // Shared novelty memory size (T3.1): how many network §13 embeddings we hold.
     const memSize = mesh.noveltyMemorySize ? mesh.noveltyMemorySize() : 0;
+    // Confirmed anomalies (T3.2): how many anomalies k+ distinct nodes currently
+    // agree on — the corroborated subset of all the local alerts on the network.
+    const confirmed = mesh.confirmedAnomalies ? mesh.confirmedAnomalies() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
       (dag.vertices ? ` · DAG ${dag.vertices} vtx` : "") +
       (memSize ? ` · mem ${memSize} emb` : "") +
+      (confirmed ? ` · ⚠ ${confirmed} confirmed` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -521,8 +525,14 @@ async function main() {
     // Null when there's no mesh or no global signal yet — the panel then shows
     // only the local novelty (the spec's "falls back to local when offline").
     if (mesh) {
+      const nowSec = Math.floor(nowT);
       for (const tr of f.trackList) {
         tr.globalNovelty = tr._emb ? mesh.globalNovelty(tr._emb, tr.icao24, nowT) : null;
+        // Anomaly consensus (T3.2): has the network corroborated MY local alert for
+        // this aircraft? Keyed by icao24, the same id we publish as the wire target.
+        // Null when no node (including us) has flagged it — the panel then says
+        // nothing about consensus.
+        tr.consensus = mesh.consensusStatus ? mesh.consensusStatus(tr.icao24, nowSec) : null;
       }
     }
     scoreAll(scorer, f.trackList);            // §15 via wasm, novelty-bearing
@@ -723,6 +733,17 @@ async function main() {
       if (tr._emb && tr._emb.length === 32) {
         payload.emb = Array.from(tr._emb, (x) => Math.round(x * 1e4) / 1e4);
       }
+      // Anomaly vote (T3.2): when this node's local §15 score lands an alert-worthy
+      // band ("strong anomaly"/"rare" — the bands whose ADR-199 §15 action is to
+      // alert), gossip that judgment so peers can corroborate it. The vote carries
+      // only the public §15 score about the (publicly broadcast) aircraft — never
+      // observer data (ADR-0007). An anomaly is "confirmed" only once k distinct
+      // nodes vote (mesh-layer's AnomalyConsensus); a lone node's vote stays
+      // unconfirmed, so a single rooftop's "local alert" is visibly not yet network-
+      // corroborated.
+      if (tr.anomaly && (tr.anomaly.band === "strong anomaly" || tr.anomaly.band === "rare")) {
+        payload.anomaly = { kind: "anomaly", score: Math.round(tr.anomaly.score * 1e3) / 1e3 };
+      }
       if (Object.keys(payload).length) d.payload = payload;
       out.push(d);
     }
@@ -738,19 +759,23 @@ async function main() {
     return mesh.canonicalTracks();
   }
 
-  // The on-dome label for a network track: the public callsign (when present)
-  // followed by its DAG-backed provenance (T2.4) — "1st <node> <age>s", i.e. the
-  // node that first saw this target and how long ago. nodeId is a public key
-  // (already on the wire), shortened to its last 5 base58 chars for legibility;
-  // raw target ids are never shown. Returns null when there's nothing to label.
+  // The on-dome label for a network track: the public callsign (when present), its
+  // DAG-backed provenance (T2.4) — "1st <node> <age>s", the node that first saw
+  // this target and how long ago — and its anomaly-consensus badge (T3.2) when the
+  // network has flagged it. nodeId is a public key (already on the wire), shortened
+  // to its last 5 base58 chars for legibility; raw target ids are never shown.
+  // Returns null when there's nothing to label. Built only when labels are on, so
+  // draw.js stays byte-identical (it just renders the string we hand it).
   function networkLabel(v, nowSec) {
-    const call = v.payload?.call || null;
+    const parts = [];
+    if (v.payload?.call) parts.push(String(v.payload.call));
     const prov = v.provenance;
-    if (!prov) return call; // anchor not settled yet — callsign only (or nothing)
-    const who = String(prov.nodeId).slice(-5);
-    const age = Math.max(0, nowSec - prov.t);
-    const tag = `1st ${who} ${age}s`;
-    return call ? `${call} · ${tag}` : tag;
+    if (prov) parts.push(`1st ${String(prov.nodeId).slice(-5)} ${Math.max(0, nowSec - prov.t)}s`);
+    // Consensus badge: ⚠confirmed×N once k+ nodes corroborate the anomaly, else
+    // ⚠unconfirmed for a still-single-node local alert. Null when no node flagged it.
+    const con = v.consensus;
+    if (con) parts.push(con.confirmed ? `⚠confirmed×${con.voters}` : "⚠unconfirmed");
+    return parts.length ? parts.join(" · ") : null;
   }
 
   // --- Render loop ---------------------------------------------------------------

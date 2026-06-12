@@ -24,6 +24,7 @@ import { canonicalizeTracks } from "../src/mesh/fusion.js";
 import { buildCoverage } from "../src/mesh/coverage.js";
 import { ProvenanceDag } from "../src/mesh/dag.js";
 import { SharedNoveltyMemory } from "../src/mesh/shared-novelty.js";
+import { AnomalyConsensus } from "../src/mesh/consensus.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -59,6 +60,21 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // embedding's only location-bearing inputs (az/el/range) are already required
   // wire fields (ADR-0007).
   const novelty = new SharedNoveltyMemory();
+  // Distributed anomaly consensus (T3.2): every Observation that carries a node's
+  // local anomaly judgment (`payload.anomaly`) — peers' AND our own publishes —
+  // becomes a vote; an anomaly is "confirmed" only once k distinct nodes agree, so
+  // §15's single-node "local alert" gains network corroboration (ADR-0006). Reads
+  // only the public target/nodeId/score; a malformed vote is ignored by `ingest`.
+  const consensus = new AnomalyConsensus();
+  function recordVote(obs) {
+    // Like `rememberEmbedding`, this ingest step has no internal error boundary
+    // we rely on, so guard it: a pathological payload must never throw into the
+    // transport's onObservation callback and stop delivery (`ingest` is written not
+    // to throw, but the boundary is cheap insurance).
+    try {
+      consensus.ingest(obs);
+    } catch { /* a hostile vote never breaks ingest */ }
+  }
   function rememberEmbedding(obs) {
     // `add` already rejects malformed embeddings, but this is the one ingest step
     // with no error boundary (unlike `anchor`'s `.catch`), so guard it too: a
@@ -82,7 +98,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // + freshness) flow straight into the network store, keyed by target — into the
   // provenance DAG for tamper-evident first-seen, and into the shared novelty
   // memory if they carry a §13 embedding.
-  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); });
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -111,6 +127,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         // the shared memory — we're part of the network's history (T3.1).
         anchor(r.value);
         rememberEmbedding(r.value);
+        recordVote(r.value); // our own anomaly flag is one of the corroborating votes
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
       return sent;
@@ -134,13 +151,19 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // nodes corroborate it), `fused`, `position` (world ECEF), and per-source
     // `residuals`. Pass the local observer so peers' tracks land where they
     // actually are in our sky, not at the peers' own (to us, meaningless) az/el.
-    canonicalTracks: () => {
+    canonicalTracks: ({ nowT = Math.floor(Date.now() / 1000) } = {}) => {
       const tracks = canonicalizeTracks(store.tracks(), { observer });
-      // Attach the DAG-backed first-seen provenance so the UI can show "first
-      // seen by node X at T" on each network track without a second pass (T2.4).
-      // Null until the async anchor for a brand-new target has settled (the UI
-      // simply omits provenance for that one frame).
-      for (const tr of tracks) tr.provenance = dag.firstSeen(tr.target);
+      for (const tr of tracks) {
+        // Attach the DAG-backed first-seen provenance so the UI can show "first
+        // seen by node X at T" on each network track without a second pass (T2.4).
+        // Null until the async anchor for a brand-new target has settled (the UI
+        // simply omits provenance for that one frame).
+        tr.provenance = dag.firstSeen(tr.target);
+        // Attach the anomaly-consensus verdict (T3.2): null when no node has flagged
+        // this target anomalous, else { confirmed, voters, k, ... } so the UI can
+        // badge confirmed (k+ nodes agree) vs unconfirmed (single-node) anomalies.
+        tr.consensus = consensus.status(tr.target, { nowT });
+      }
       return tracks;
     },
     // The coverage picture for the "where does the network have eyes?" heatmap
@@ -189,11 +212,23 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     },
     // Roll-up for the network-sky readout / diagnostics.
     dagStats: () => ({ vertices: dag.size, targets: dag.targetCount, ...dag.stats }),
+    // Anomaly consensus (T3.2): the corroboration verdict for one target — null if
+    // no node has flagged it, else { confirmed, voters, k, kind, maxScore }. `nowT`
+    // drives vote freshness; defaults to wall-clock so a caller can omit it.
+    consensusStatus: (target, nowT = Math.floor(Date.now() / 1000)) => consensus.status(target, { nowT }),
+    // How many anomalies are currently confirmed (k+ distinct nodes agree) — the
+    // headline count for the network-sky readout.
+    confirmedAnomalies: (nowT = Math.floor(Date.now() / 1000)) => consensus.confirmedCount(nowT),
+    // { confirmed, total } across all currently-flagged anomalies, for diagnostics.
+    consensusSummary: (nowT = Math.floor(Date.now() / 1000)) => consensus.summary(nowT),
     // Await all in-flight DAG anchors (anchoring is async on the live path).
     // Lets a caller read a settled provenance view right after publishing.
     idle: () => Promise.all([...pendingAnchors]),
     publish,
-    prune: () => store.prune(),
+    // Age out stale state on the caller's cadence: the network store's sources AND
+    // the consensus memory's votes (both keyed to the same freshness window, so a
+    // target that drops off the sky also drops out of consensus).
+    prune: () => { const s = store.prune(); consensus.prune(Math.floor(Date.now() / 1000)); return s; },
     // Cumulative transport + store counters, for diagnostics/tests.
     stats: () => ({ transport: transport.stats, store: store.stats }),
     dispose: () => { off(); transport.leave(); },

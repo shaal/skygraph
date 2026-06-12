@@ -96,6 +96,16 @@ export function renderDetails(v) {
     lines.push(`global novelty ${tr.globalNovelty.toFixed(2)} — §13 vs ` +
       `${v.globalNoveltySize} network embeddings (mesh)`);
   }
+  // Distributed anomaly consensus (T3.2): when the network has flagged this target,
+  // say whether k+ independent nodes agree (confirmed) or it's still a single-node
+  // local alert (unconfirmed), with the corroborating node count. Absent (null) ⇒
+  // no node flagged it / no mesh — the line simply doesn't show.
+  if (tr.consensus) {
+    const con = tr.consensus;
+    lines.push(con.confirmed
+      ? `⚠ confirmed anomaly · corroborated by ${con.voters} node${con.voters === 1 ? "" : "s"} (mesh)`
+      : `anomaly unconfirmed · ${con.voters}/${con.k} nodes (mesh)`);
+  }
   details.innerHTML = who +
     lines.map((l) => line(l, tr.emergency ? "#ff5252" : c)).join("");
 }
