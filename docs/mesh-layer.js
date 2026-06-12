@@ -31,6 +31,7 @@ import { ReputationLedger } from "../src/mesh/reputation.js";
 import { ContributionLedger } from "../src/mesh/ruv.js";
 import { SlashingLedger } from "../src/mesh/slashing.js";
 import { createSensorRegistry, SENSOR_KIND } from "../src/mesh/sensors.js";
+import { createWatcherRegistry, createBurstWatcher } from "../src/mesh/watchers.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -132,6 +133,17 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // already modality-agnostic store/fusion/render path carries them to the network
   // sky with no special-casing. Empty by default → the real app is unchanged.
   const sensors = createSensorRegistry();
+  // Swarm watchers (T5.2, ADR-0006/ADR-0001): cross-node pattern agents that SCAN
+  // the provenance DAG for structure no single node sees. The reference watcher
+  // detects a synchronized cross-node contact BURST — ≥k targets first-seen within
+  // one time window, in one coarse region, by ≥2 DISTINCT nodes (so no single node
+  // saw the whole pattern). Stateless: each `swarmAlerts` call is a pure scan over
+  // the DAG's firstSeen summaries (no new wire data, no new state to prune — it
+  // inherits the DAG's bounds), so every node holding the same Observations raises
+  // the same alerts (coordinator-free, ADR-0005). In the normal single-real-feed
+  // case one node first-sees everything, so the cross-node gate keeps it silent.
+  const watchers = createWatcherRegistry();
+  watchers.register(createBurstWatcher());
   // The time span (seconds) of a track's POSITIONED sources — the ones reputation
   // scores (those in `residuals`). Used to gate reputation on a co-temporal fuse
   // (see REP_CO_TEMPORAL_WINDOW_S). Infinity when the store has no such track.
@@ -394,6 +406,18 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     },
     // Roll-up for the network-sky readout / diagnostics.
     dagStats: () => ({ vertices: dag.size, targets: dag.targetCount, ...dag.stats }),
+    // Swarm watchers (T5.2): run every registered cross-node pattern agent over the
+    // DAG and return their alerts. A pure scan over the DAG's per-target firstSeen
+    // summaries (the durable "first seen by node X at T"); each alert carries its
+    // EVIDENCE — the member targets with their DAG `vertexId`, the contributing
+    // nodes, the coarse cells, and the time window. Empty in a healthy/solo mesh, so
+    // the readout segment stays hidden. `nowT` drives freshness; defaults to wall-clock.
+    swarmAlerts: ({ nowT = Math.floor(Date.now() / 1000) } = {}) => {
+      const firstSeen = dag.targets().map((t) => dag.firstSeen(t)).filter(Boolean);
+      return watchers.scan({ nowT, firstSeen, provenance: (target) => dag.provenance(target) }).alerts;
+    },
+    // Watcher registry roll-up for diagnostics/tests.
+    watcherStats: () => ({ watchers: watchers.size, ...watchers.stats }),
     // Anomaly consensus (T3.2): the corroboration verdict for one target — null if
     // no node has flagged it, else { confirmed, voters, k, kind, maxScore }. `nowT`
     // drives vote freshness; defaults to wall-clock so a caller can omit it.

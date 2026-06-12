@@ -403,6 +403,11 @@ async function main() {
     // reaching the network sky. 0 unless a node is running a sensor plugin, so the
     // segment stays hidden in a plain ADS-B mesh.
     const sensors = mesh.sensorContacts ? mesh.sensorContacts() : 0;
+    // Swarm watchers (T5.2): how many cross-node patterns the DAG-scanning agents
+    // currently flag (e.g. a synchronized contact burst no single node sees). 0 in a
+    // healthy/solo mesh — the cross-node gate keeps it silent unless ≥2 nodes
+    // independently feed one surge — so the segment stays hidden by default.
+    const swarm = mesh.swarmAlerts ? mesh.swarmAlerts().length : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
@@ -414,6 +419,7 @@ async function main() {
       (rfZones ? ` · RF ${rfZones} zone${rfZones === 1 ? "" : "s"}` : "") +
       (distrusted ? ` · ⚑ ${distrusted} distrusted` : "") +
       (slashed ? ` · ⛔ ${slashed} slashed` : "") +
+      (swarm ? ` · ⊛ ${swarm} swarm` : "") +
       (ruvNodes ? ` · ⊕ rUv ${ruvNodes}n` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }

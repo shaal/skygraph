@@ -82,6 +82,15 @@ const SLASH_REASON = params.get("slashreason") || "spoof";
 // tabs fuse into one ×2 contact; pin ?target=/?az=/?el=/?range= to override. E.g.:
 //   ?bus=skygraph-edgenet&topic=all-sky&sensor=wifi-csi
 const SENSOR = params.get("sensor") || "";
+// T5.2 swarm-watcher injection. `?burst=N` makes each publish tick emit N DISTINCT
+// brand-new contacts at once — a synchronized surge of first-sightings — instead of
+// one. Open TWO tabs with `?burst` on the same bus (their first-sightings then span
+// two distinct nodes in one region/window) and the app's swarm watcher raises a
+// cross-node burst alert, lighting the readout's "⊛ N swarm". Each contact's target
+// is namespaced to this node so the two tabs' surges don't collide and each is
+// first-seen by its own node (the cross-node gate). E.g.:
+//   ?bus=skygraph-edgenet&topic=all-sky&burst=4   (in two tabs)
+const BURST = params.has("burst") ? Math.max(0, Math.floor(Number(params.get("burst")) || 0)) : 0;
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -108,10 +117,12 @@ function logLine(msg) {
 // A synthetic aircraft Observation: a random target with plausible az/el. Real
 // nodes would derive these from ADS-B; here they're invented so peers have
 // something to exchange.
-async function makeObservation() {
+async function makeObservation(burstTarget) {
   // T5.1: in sensor mode default the target to the WiFi-CSI plugin's contact id so
   // co-located tabs (and the app's own plugin) corroborate ONE contact and fuse it.
-  const target = FIXED_TARGET || (SENSOR ? "csi-contact-1" : "SIM" + Math.floor(100 + Math.random() * 900));
+  // T5.2: a burst contact uses a node-namespaced unique target so each is a fresh
+  // first-sighting attributed to THIS node (the swarm watcher's cross-node gate).
+  const target = burstTarget || FIXED_TARGET || (SENSOR ? "csi-contact-1" : "SIM" + Math.floor(100 + Math.random() * 900));
   let az = FIXED_AZ != null && Number.isFinite(FIXED_AZ) ? FIXED_AZ : +(Math.random() * 360).toFixed(1);
   // T4.1: a spoofer broadcasts a bearing grossly off the honest one for the same
   // target, so it lands far from the fused consensus and earns a low reputation.
@@ -146,11 +157,22 @@ async function makeObservation() {
   return sign(draft, identity);
 }
 
+let burstSeq = 0; // monotonic, node-namespaced ⇒ globally-unique burst target ids
 async function publishOne() {
   try {
-    const obs = await makeObservation();
-    await transport.publish(obs);
-    published++;
+    if (BURST > 0) {
+      // T5.2: emit a SURGE of N distinct brand-new contacts at once, so two such
+      // tabs raise a synchronized cross-node burst the swarm watcher flags.
+      for (let i = 0; i < BURST; i++) {
+        const obs = await makeObservation(`B-${short(identity.nodeId)}-${burstSeq++}`);
+        await transport.publish(obs);
+        published++;
+      }
+    } else {
+      const obs = await makeObservation();
+      await transport.publish(obs);
+      published++;
+    }
     $("published").textContent = String(published);
   } catch (err) {
     logLine("publish failed: " + err.message);
