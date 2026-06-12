@@ -89,6 +89,13 @@ export function renderDetails(v) {
     lines.push(`vector novelty ${tr.novelty.toFixed(2)} — §13 embedding vs ` +
       `${v.noveltySize} stored tracks (IndexedDB)`);
   }
+  // Global novelty (T3.1): the same §13 embedding scored against the whole
+  // network's history, not just this rooftop's. Only present when the mesh has a
+  // global signal; absent (null) ⇒ offline / no peers, so only the local line shows.
+  if (typeof tr.globalNovelty === "number") {
+    lines.push(`global novelty ${tr.globalNovelty.toFixed(2)} — §13 vs ` +
+      `${v.globalNoveltySize} network embeddings (mesh)`);
+  }
   details.innerHTML = who +
     lines.map((l) => line(l, tr.emergency ? "#ff5252" : c)).join("");
 }

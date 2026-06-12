@@ -140,6 +140,84 @@ test("canonicalTracks fuses two corroborating peers into one ×N track (T2.1)", 
   c.dispose();
 });
 
+// A 32-dim §13-shaped embedding (the wire shape: a plain number[] in [0,1]).
+function embVec(fill, jitter = 0) {
+  return Array.from({ length: 32 }, () => fill + jitter);
+}
+
+test("T3.1 — a peer's gossiped §13 embedding drives our global novelty", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+
+  // b sees four targets all near the SAME embedding and gossips them. a never saw
+  // any of these locally — its only knowledge is the network's, via the mesh.
+  for (let i = 0; i < 4; i++) {
+    await b.publish([aircraftDraft(`low${i}`, 90, 30, { payload: { emb: embVec(0.05, i * 1e-5) } })]);
+  }
+  assert.equal(a.noveltyMemorySize(), 4, "a folded b's four embeddings into its shared memory");
+
+  // An embedding the network HAS seen scores ~0 (familiar to the network), even
+  // though a never saw it on its own rooftop — the headline T3.1 capability.
+  const seen = a.globalNovelty(embVec(0.05), "queryTarget", nowSec());
+  assert.ok(seen !== null && seen < 0.05, `network-seen track is not novel (${seen})`);
+  // A far-away embedding the network has never seen saturates to fully novel.
+  const novel = a.globalNovelty(embVec(0.95), "queryTarget", nowSec());
+  assert.equal(novel, 1, "a track new to the whole network is maximally novel");
+
+  a.dispose();
+  b.dispose();
+});
+
+test("T3.1 — solo node: shared memory empty, global novelty null (falls back to local)", async () => {
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: freshBus(), topic: "t" });
+  assert.equal(a.peerCount(), 0);
+  // No peers ⇒ publish is a no-op ⇒ nothing reaches the shared memory.
+  await a.publish([aircraftDraft("x", 10, 20, { payload: { emb: embVec(0.3) } })]);
+  assert.equal(a.noveltyMemorySize(), 0);
+  assert.equal(a.globalNovelty(embVec(0.3), "x", nowSec()), null, "offline ⇒ null ⇒ caller uses local");
+  a.dispose();
+});
+
+test("T3.1 — our own published embeddings join the network history", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  await a.publish([aircraftDraft("mine", 90, 30, { payload: { emb: embVec(0.4) } })]);
+  assert.equal(a.noveltyMemorySize(), 1, "a is part of the network's history");
+  assert.equal(b.noveltyMemorySize(), 1, "and the peer received it");
+  a.dispose();
+  b.dispose();
+});
+
+test("T3.1 — embeddingless / malformed payloads leave the memory (and T1.3 store) intact", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  await b.publish([
+    aircraftDraft("noemb", 90, 30, { payload: { call: "X" } }), // no embedding
+    aircraftDraft("bademb", 80, 20, { payload: { emb: [1, 2, 3] } }), // wrong width
+  ]);
+  assert.equal(a.noveltyMemorySize(), 0, "neither was admitted to the shared memory");
+  assert.equal(a.remoteCount(), 2, "but both still land in the network store — no T1.3 regression");
+  a.dispose();
+  b.dispose();
+});
+
+test("T3.1 — a gossiped embedding leaks no location, only az/el-derived numbers", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  await b.publish([aircraftDraft("priv", 90, 30, { payload: { emb: embVec(0.2) } })]);
+  const o = a.remoteTracks()[0].latest();
+  assert.ok(Array.isArray(o.payload.emb) && o.payload.emb.length === 32, "emb rides in payload");
+  for (const forbidden of ["lat", "lon", "alt", "alt_m", "latitude", "longitude"]) {
+    assert.ok(!deepKeys(o).includes(forbidden), `embedding wire record must not carry "${forbidden}"`);
+  }
+  a.dispose();
+  b.dispose();
+});
+
 test("a node's newer look supersedes its older one for the same target", async () => {
   const bus = freshBus();
   const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });

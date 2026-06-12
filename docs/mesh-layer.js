@@ -23,6 +23,7 @@ import { NetworkTrackStore } from "../src/mesh/network-store.js";
 import { canonicalizeTracks } from "../src/mesh/fusion.js";
 import { buildCoverage } from "../src/mesh/coverage.js";
 import { ProvenanceDag } from "../src/mesh/dag.js";
+import { SharedNoveltyMemory } from "../src/mesh/shared-novelty.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -50,6 +51,24 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // store's TTL pruning and stays independently verifiable (ADR-0005 §3). The
   // anchor runs alongside the store ingest on the same already-verified feed.
   const dag = new ProvenanceDag();
+  // The shared novelty memory (T3.1): the network's §13 embedding history. Every
+  // Observation that carries a gossiped embedding (`payload.emb`) — peers' looks
+  // AND our own publishes — folds into it, so "novel" can mean "new to the whole
+  // network" (ADR-0006), not just to this rooftop. Malformed embeddings are
+  // ignored by `add`, so a hostile peer can't corrupt it. Privacy holds: an
+  // embedding's only location-bearing inputs (az/el/range) are already required
+  // wire fields (ADR-0007).
+  const novelty = new SharedNoveltyMemory();
+  function rememberEmbedding(obs) {
+    // `add` already rejects malformed embeddings, but this is the one ingest step
+    // with no error boundary (unlike `anchor`'s `.catch`), so guard it too: a
+    // pathological payload must never throw into the transport's onObservation
+    // callback and stop delivery.
+    try {
+      const emb = obs?.payload?.emb;
+      if (emb) novelty.add(obs.target, obs.t, emb);
+    } catch { /* a hostile embedding never breaks ingest */ }
+  }
   // DAG anchoring is async (a SHA-256 content hash); fire-and-forget on the live
   // path so ingest never blocks, but track in-flight anchors so tests (and any
   // caller that needs a settled view) can await them. `anchor` never rejects.
@@ -60,9 +79,10 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   }
   transport.join(topic);
   // Verified, fresh peer Observations (the transport already checked signature
-  // + freshness) flow straight into the network store, keyed by target — and into
-  // the provenance DAG for tamper-evident first-seen.
-  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); });
+  // + freshness) flow straight into the network store, keyed by target — into the
+  // provenance DAG for tamper-evident first-seen, and into the shared novelty
+  // memory if they carry a §13 embedding.
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -87,8 +107,10 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         if (r.status !== "fulfilled") continue;
         // Anchor our own sightings too: the network's first-seen for a target may
         // well be us (peers don't echo our publishes back, so this is the only
-        // path our own looks reach the DAG).
+        // path our own looks reach the DAG). Likewise fold our own embedding into
+        // the shared memory — we're part of the network's history (T3.1).
         anchor(r.value);
+        rememberEmbedding(r.value);
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
       return sent;
@@ -145,6 +167,16 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
       return cov;
     },
     remoteCount: () => store.size,
+    // Global §13 novelty (T3.1): score a track's embedding against the WHOLE
+    // network's history, not just this rooftop's local store. Returns null when
+    // there's no global signal yet (offline / no peers) so the caller falls back
+    // to its local novelty. `target`/`nowT` drive the network-wide self-exclusion
+    // (a target is never novel against its own current looks). `emb` is the 32-dim
+    // §13 embedding the local store already computes per track (tr._emb).
+    globalNovelty: (emb, target, nowT) => novelty.globalNovelty(emb, { target, nowT }),
+    // How many network embeddings the shared memory currently holds — the global
+    // counterpart of the local store's size, for the readout / detail panel.
+    noveltyMemorySize: () => novelty.size,
     // Provenance (T2.4): full tamper-evident history for one target — the durable
     // first-seen plus the deterministically-ordered chain of update vertices.
     provenance: (target) => dag.provenance(target),

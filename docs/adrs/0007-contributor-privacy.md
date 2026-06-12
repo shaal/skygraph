@@ -25,9 +25,16 @@ Privacy is built into the protocol, not bolted on:
 - **Pseudonymous identity.** `nodeId` is a public key, not a person ([ADR-0004](./0004-signed-observation-and-identity.md)); rotation supported.
 - **Onion-routing option.** Where QuDAG's anonymous transport is available,
   contributing need not reveal the node's network origin.
-- **Local-first data ownership.** Raw feeds and §13 embeddings stay on-device;
-  only derived, coarse, signed Observations and sparsified gradients leave
-  ([ADR-0006](./0006-federated-intelligence.md)).
+- **Local-first data ownership.** Raw feeds and raw point histories stay
+  on-device; only derived, coarse, signed Observations and sparsified gradients
+  leave ([ADR-0006](./0006-federated-intelligence.md)). A §13 *track embedding* is
+  gossiped for shared novelty (ADR-0006, T3.1) — but only because it carries **no
+  location-bearing input beyond the az/el/range already on the wire**: it is a
+  non-invertible aggregate of the *target's* motion (altitude, signal, heading,
+  speed, time-of-day), never the observer's whereabouts. (This supersedes the
+  original "§13 embeddings stay on-device" wording, which conflated the private
+  raw history with the non-locating aggregate the federated-novelty mechanism
+  needs.)
 
 ## Consequences
 

@@ -342,10 +342,13 @@ async function main() {
     // Provenance roll-up (T2.4): how many tamper-evident vertices the local DAG
     // currently anchors — shows the "first seen by X at T" record is live.
     const dag = mesh.dagStats ? mesh.dagStats() : { vertices: 0 };
+    // Shared novelty memory size (T3.1): how many network §13 embeddings we hold.
+    const memSize = mesh.noveltyMemorySize ? mesh.noveltyMemorySize() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
       (dag.vertices ? ` · DAG ${dag.vertices} vtx` : "") +
+      (memSize ? ` · mem ${memSize} emb` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -482,6 +485,7 @@ async function main() {
     renderDetails({
       details, selected, selectedSat, satsAbove, satNames, sun,
       feed, spaceWx, noveltySize: novelty.size(), conflicts, requestRoute,
+      globalNoveltySize: mesh ? mesh.noveltyMemorySize() : 0,
     });
   }
 
@@ -512,6 +516,15 @@ async function main() {
     const nowT = Date.now() / 1000;
     for (const tr of f.trackList) projectNew(tr);
     novelty.update(wasm, f.trackList, nowT);  // §13 embed + §15 novelty (tr.novelty)
+    // Global §13 novelty (T3.1): score each track's embedding against the WHOLE
+    // network's history (the mesh's shared memory), alongside the local score.
+    // Null when there's no mesh or no global signal yet — the panel then shows
+    // only the local novelty (the spec's "falls back to local when offline").
+    if (mesh) {
+      for (const tr of f.trackList) {
+        tr.globalNovelty = tr._emb ? mesh.globalNovelty(tr._emb, tr.icao24, nowT) : null;
+      }
+    }
     scoreAll(scorer, f.trackList);            // §15 via wasm, novelty-bearing
     detectBehaviors(f.trackList, nowT);       // HOLD / GRID / GO-AROUND / FORM
     conflicts = CFG.conflicts ? detectConflicts(f.trackList, nowT) : [];
@@ -695,10 +708,22 @@ async function main() {
       if (!p || p.az === undefined || !(p.el > 0)) continue;
       const d = { kind: "aircraft", target: tr.icao24, t: nowSec, az: p.az, el: p.el };
       if (Number.isFinite(p.range)) d.range_m = p.range;
-      // payload carries only the public callsign — never any location data
-      // (ADR-0007: the coarse obsCell, added in mesh-layer.js, is the only place
-      // the observer's whereabouts may appear on the wire).
-      if (tr.label) d.payload = { call: String(tr.label).slice(0, 16) };
+      // payload carries only the public callsign and the §13 track embedding —
+      // never any location data (ADR-0007: the coarse obsCell, added in
+      // mesh-layer.js, is the only place the observer's whereabouts may appear on
+      // the wire; the embedding's only LOCATION-bearing inputs are az/el/range,
+      // already on the wire — its other inputs are the target's non-locating
+      // motion). The embedding (T3.1) is gossiped so peers can fold it into the
+      // shared novelty memory — a receiver can't recompute it, since the network
+      // store keeps only each node's latest single look per target, not the
+      // multi-point track history embedding needs. Rounded to 4 decimals for wire
+      // economy (novelty is calibrated/clamped — 1e-4 is noise).
+      const payload = {};
+      if (tr.label) payload.call = String(tr.label).slice(0, 16);
+      if (tr._emb && tr._emb.length === 32) {
+        payload.emb = Array.from(tr._emb, (x) => Math.round(x * 1e4) / 1e4);
+      }
+      if (Object.keys(payload).length) d.payload = payload;
       out.push(d);
     }
     return out;
