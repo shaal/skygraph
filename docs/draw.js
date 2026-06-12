@@ -352,6 +352,92 @@ function withAlpha(hex, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 
+// rUv contribution leaderboard inset (T4.2): a small ranked panel — top-right, so
+// it clears the bottom coverage/RF insets and the top-left readout — listing the
+// nodes earning the most rUv (uptime × unique-coverage × early-adopter multiplier,
+// a non-redeemable participation metric, ADR-0008). `lb` is the structure from the
+// mesh layer's `ruvLeaderboard`: rows already sorted by rUv (desc) with `rank`,
+// short-able `nodeId`, the score, an `earliest` flag (founding cohort, ★) and
+// `isLocal` ("you"). Self-contained — saves/restores all ctx state and never
+// touches the dome or its tracks (zero regression surface). Toggle-gated like the
+// coverage inset, so when on-but-empty it shows a placeholder rather than vanishing.
+// topGap clears the top-right #view-toggle (2D/3D, top:10 + ~28px tall) with margin
+// to spare, so the panel never abuts it even if that control's padding grows.
+const LEADERBOARD_PANEL = { w: 208, margin: 12, pad: 8, header: 17, footer: 14, row: 16, topGap: 48, maxRows: 5 };
+
+function shortNode(id) {
+  return typeof id === "string" ? id.replace(/^pk:/, "").slice(0, 8) : "—";
+}
+
+export function drawLeaderboard(ctx, lb, w, h) {
+  const P = LEADERBOARD_PANEL;
+  const rowsAll = lb && Array.isArray(lb.rows) ? lb.rows : [];
+  const rows = rowsAll.slice(0, P.maxRows);
+  const bodyRows = Math.max(rows.length, 1); // a placeholder row when empty
+  const panelH = P.header + bodyRows * P.row + P.footer + P.pad;
+  if (w < P.w + 2 * P.margin || h < panelH + P.topGap + 2 * P.margin) return; // too cramped — skip
+  const x0 = w - P.w - P.margin, y0 = P.margin + P.topGap;
+  ctx.save();
+  // Panel chrome — violet accent to read as a mesh feature (sibling of the readout).
+  ctx.fillStyle = "rgba(13,18,32,0.86)";
+  ctx.strokeStyle = "#27345c";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.rect(x0, y0, P.w, panelH); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#a78bfa";
+  ctx.font = "bold 10px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText("⊕ rUv CONTRIBUTORS", x0 + P.pad, y0 + 12);
+
+  if (rows.length === 0) {
+    ctx.fillStyle = "#3d4d78";
+    ctx.font = "10px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("no contributors yet", x0 + P.w / 2, y0 + P.header + P.row);
+    ctx.restore();
+    return;
+  }
+
+  // Rows: rank · short nodeId (★ founding cohort, "you" local) · rUv bar · score.
+  const maxRuv = Number.isFinite(lb.totals?.maxRuv) && lb.totals.maxRuv > 0 ? lb.totals.maxRuv : 1;
+  const barX = x0 + P.pad + 96;          // bar starts after the id column
+  const barMax = P.w - (barX - x0) - P.pad - 34; // leave room for the score on the right
+  let y = y0 + P.header + 11;
+  for (const r of rows) {
+    const local = !!r.isLocal;
+    ctx.font = "10px monospace";
+    ctx.textAlign = "left";
+    // rank
+    ctx.fillStyle = "#5e6f9e";
+    ctx.fillText(`${r.rank}.`, x0 + P.pad, y);
+    // short id (+ ★ for the earliest, brighter when it's us)
+    ctx.fillStyle = local ? "#5aa9ff" : "#c7d2e8";
+    const star = r.earliest ? "★" : "";
+    ctx.fillText(`${shortNode(r.nodeId)}${star}${local ? " you" : ""}`, x0 + P.pad + 18, y);
+    // rUv bar, proportional to the leader's score
+    const frac = Math.max(0, Math.min(1, (Number.isFinite(r.ruv) ? r.ruv : 0) / maxRuv));
+    const bw = Math.max(2, barMax * frac);
+    ctx.fillStyle = withAlpha(local ? "#5aa9ff" : "#a78bfa", "0.85");
+    ctx.fillRect(barX, y - 7, bw, 7);
+    // score
+    ctx.fillStyle = "#9fb0d8";
+    ctx.textAlign = "right";
+    ctx.fillText((Number.isFinite(r.ruv) ? r.ruv : 0).toFixed(1), x0 + P.w - P.pad, y);
+    y += P.row;
+  }
+
+  // Footer roll-up: contributor count. Defaulted so a board missing totals can't
+  // throw out of the render loop (drawn from the rAF tick with no surrounding try).
+  const { nodes = rows.length } = lb.totals || {};
+  ctx.fillStyle = "#7e90bd";
+  ctx.font = "9px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText(
+    `${nodes} contributor${nodes === 1 ? "" : "s"} · rUv metric`,
+    x0 + P.pad, y0 + panelH - 5,
+  );
+  ctx.restore();
+}
+
 // Dashed red line between a conflicting pair (current display positions).
 export function drawConflictLine(ctx, pa, pb, w, h, label) {
   const [x1, y1, v1] = polarScreenXY(pa.az, pa.el, w, h);

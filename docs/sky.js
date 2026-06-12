@@ -17,7 +17,7 @@ import { LiveFeed, displayPoint, syncLiveTable } from "./live-feed.js";
 import { moonPosition, satSunlit, sunPosition } from "./astro.js";
 import { scoreAll } from "./score-live.js";
 import {
-  BAND_COLORS, drawConflictLine, drawCone, drawCoverage, drawNetworkTrack, drawRfIntegrity,
+  BAND_COLORS, drawConflictLine, drawCone, drawCoverage, drawLeaderboard, drawNetworkTrack, drawRfIntegrity,
   drawSkyDome, drawTrack, LIVE_COLOR, SAT_COLOR, SAT_VISIBLE_COLOR,
 } from "./draw.js";
 import { CFG, initDrawer, saveSettings } from "./settings.js";
@@ -197,6 +197,16 @@ async function main() {
     rfSnap = mesh.rfHeatmap();
   }
 
+  // rUv contribution leaderboard (T4.2): a cached snapshot of the top contributors
+  // (uptime × unique-coverage × early-adopter, a non-redeemable metric — ADR-0008),
+  // refreshed on the 1 Hz mesh tick (and immediately when toggled on) and drawn each
+  // frame as a top-right inset. Toggle-gated like the coverage map.
+  let leaderboardSnap = null;
+  function updateLeaderboard() {
+    if (!mesh || !CFG.leaderboard) return;
+    leaderboardSnap = mesh.ruvLeaderboard({ limit: 5 });
+  }
+
   // --- Satellite layer (wasm SGP4; stays off without ./pkg) -------------------
   let satProp = null, satNames = [], satsAbove = [], passes = null;
   let satGen = 0;
@@ -280,6 +290,7 @@ async function main() {
     onWebgpu: setWebgpu,
     onTleGroup: (g) => loadSats(g),
     onCoverage: () => updateCoverage(), // refresh the inset the moment it's toggled on
+    onLeaderboard: () => updateLeaderboard(), // ditto for the rUv leaderboard inset
     onPassAlerts: async () => (passes ? passes.enableAlerts() : false),
     // Location controls. Each choice persists then reloads, so the whole
     // pipeline (ECEF, wasm projector, SGP4, feed search) re-inits cleanly
@@ -367,6 +378,10 @@ async function main() {
     // consistently disagreeing with the corroborated consensus, so down-weighted in
     // fusion. 0 in a healthy mesh, so the segment stays hidden.
     const distrusted = mesh.distrustedNodes ? mesh.distrustedNodes() : 0;
+    // rUv contribution accounting (T4.2): how many distinct nodes currently earn a
+    // fresh rUv credit — the headline count for the leaderboard. 0 only on a solo
+    // idle node, so the segment is live once the mesh is participating.
+    const ruvNodes = mesh.ruvContributors ? mesh.ruvContributors() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
@@ -376,6 +391,7 @@ async function main() {
       (fedNodes ? ` · model ${fedNodes}n` : "") +
       (rfZones ? ` · RF ${rfZones} zone${rfZones === 1 ? "" : "s"}` : "") +
       (distrusted ? ` · ⚑ ${distrusted} distrusted` : "") +
+      (ruvNodes ? ` · ⊕ rUv ${ruvNodes}n` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -782,6 +798,8 @@ async function main() {
     // RF-integrity inset (T3.4), bottom-left: spoof/jam zones the network detects.
     // Self-hides when nothing is flagged, so it's drawn whenever the mesh is up.
     if (mesh && rfSnap) drawRfIntegrity(ctx, rfSnap, w, h);
+    // rUv leaderboard inset (T4.2), top-right: ranked contributors (2D view only).
+    if (CFG.leaderboard && mesh && leaderboardSnap) drawLeaderboard(ctx, leaderboardSnap, w, h);
   }
 
   // Build the signed-Observation drafts for what this node sees right now: its
@@ -914,6 +932,7 @@ async function main() {
       if (CFG.networkSky) updateMeshReadout();
       if (CFG.coverageHeatmap) updateCoverage();
       updateRf(); // RF-integrity inset refresh — cheap, self-hides when no zone is lit
+      if (CFG.leaderboard) updateLeaderboard(); // rUv leaderboard inset refresh
     }, 1000);
     // Announce departure so peers' "N nodes online" reacts promptly to this tab
     // closing. beforeunload misses mobile/bfcache; pagehide covers those. leave()

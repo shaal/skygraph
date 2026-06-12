@@ -6,7 +6,7 @@ export const SETTINGS_KEY = "skygraph-settings-v1";
 const DEFAULTS = {
   aircraft: true, satellites: true, sunmoon: true, trails: true, labels: true,
   conflicts: true, trailLen: 150, webgpuSats: false, tleGroup: "visual",
-  view3d: false, networkSky: false, coverageHeatmap: false,
+  view3d: false, networkSky: false, coverageHeatmap: false, leaderboard: false,
 };
 
 export const CFG = (() => {
@@ -77,6 +77,19 @@ export function initDrawer(handlers) {
       CFG.coverageHeatmap = covBox.checked;
       saveSettings();
       if (covBox.checked) handlers.onCoverage?.();
+    });
+  }
+
+  // rUv contributor leaderboard (T4.2): same shape as the coverage toggle — a mesh
+  // feature whose inset only draws under the built app, but the toggle persists
+  // either way. Refresh immediately on enable so it appears without the 1 Hz wait.
+  const lbBox = document.getElementById("opt-leaderboard");
+  if (lbBox) {
+    lbBox.checked = CFG.leaderboard;
+    lbBox.addEventListener("change", () => {
+      CFG.leaderboard = lbBox.checked;
+      saveSettings();
+      if (lbBox.checked) handlers.onLeaderboard?.();
     });
   }
 

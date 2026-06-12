@@ -371,3 +371,81 @@ test("T4.1 — reputation is computed locally and never rides the wire (privacy)
 
   a.dispose(); b.dispose(); c.dispose();
 });
+
+// ── T4.2 — rUv contribution accounting, end-to-end with real Ed25519 ──────────
+// The spec's "credits accrue per node in sim; leaderboard renders": several nodes
+// participate from their coarse cells; the observing node credits each for uptime +
+// *unique* coverage (a node alone on a cell out-earns two piling onto one), and a
+// second pure observer converges on the SAME board with no rUv on the wire.
+
+test("T4.2 — credits accrue per node; unique coverage outranks piling on; boards converge", async () => {
+  const bus = freshBus();
+  // a, f are pure OBSERVERS (never publish) — each builds the leaderboard purely
+  // from peers' Observations, so the two must converge bit-identically.
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const f = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  // solo sits alone in its coarse cell; x and y are co-located (share one cell), so
+  // their unique-coverage credit is split (rarity 1/2) while solo's is full.
+  const solo = await startMeshLayer({ observer: { name: "solo", lat: 43.47, lon: -79.69, alt_m: 100 }, kind: "qudag", busId: bus, topic: "t" });
+  const shared = { name: "shared", lat: 43.20, lon: -80.05, alt_m: 100 };
+  const x = await startMeshLayer({ observer: shared, kind: "qudag", busId: bus, topic: "t" });
+  const y = await startMeshLayer({ observer: shared, kind: "qudag", busId: bus, topic: "t" });
+
+  const base = nowSec();
+  // Each publishes across three distinct 10 s buckets (uptime accrues). Same target
+  // is fine — rUv reads only nodeId/obsCell/t, never the target.
+  for (const dt of [-30, -20, -10]) {
+    const t = base + dt;
+    await solo.publish([{ kind: "aircraft", target: "T", t, az: 90, el: 30, range_m: 50000 }]);
+    await x.publish([{ kind: "aircraft", target: "T", t, az: 90, el: 30, range_m: 50000 }]);
+    await y.publish([{ kind: "aircraft", target: "T", t, az: 90, el: 30, range_m: 50000 }]);
+  }
+
+  const lb = a.ruvLeaderboard({ nowT: base });
+  // Credits accrued for all three publishers; the pure observer a earns nothing.
+  const ids = lb.rows.map((r) => r.nodeId);
+  assert.ok(ids.includes(solo.nodeId) && ids.includes(x.nodeId) && ids.includes(y.nodeId));
+  assert.ok(!ids.includes(a.nodeId), "a pure observer earns no rUv");
+  for (const r of lb.rows) assert.ok(r.ruv > 0, "each publisher accrued rUv");
+
+  // Unique coverage: solo (alone on its cell) outranks the co-located pair, and its
+  // per-bucket credit is exactly double theirs (rarity halves a shared cell).
+  assert.equal(lb.rows[0].nodeId, solo.nodeId);
+  const soloRow = lb.rows.find((r) => r.nodeId === solo.nodeId);
+  const xRow = lb.rows.find((r) => r.nodeId === x.nodeId);
+  assert.ok(soloRow.ruv > xRow.ruv, `solo ${soloRow.ruv} > piler ${xRow.ruv}`);
+  assert.ok(Math.abs(soloRow.coverage - 2 * xRow.coverage) < 1e-9, "rarity halves the pile-on credit");
+  assert.equal(soloRow.uptime, 3, "three distinct buckets of uptime");
+  // The mesh layer badges the local node for the inset (none here — a never published).
+  assert.equal(soloRow.isLocal, false);
+
+  // Convergence: the independent observer f computed a bit-identical board with no
+  // rUv gossip — the coordinator-free claim, tested not asserted.
+  const lbF = f.ruvLeaderboard({ nowT: base });
+  assert.deepEqual(lbF.rows.map((r) => [r.nodeId, r.ruv]), lb.rows.map((r) => [r.nodeId, r.ruv]));
+  assert.equal(a.ruvContributors(base), 3);
+
+  a.dispose(); f.dispose(); solo.dispose(); x.dispose(); y.dispose();
+});
+
+test("T4.2 — rUv is derived locally; nothing rUv-shaped or location-bearing rides the wire", async () => {
+  const bus = freshBus();
+  const a = await startMeshLayer({ observer: OBSERVER, kind: "qudag", busId: bus, topic: "t" });
+  const b = await startMeshLayer({ observer: { name: "b", lat: 43.47, lon: -79.69, alt_m: 100 }, kind: "qudag", busId: bus, topic: "t" });
+
+  const base = nowSec();
+  await b.publish([{ kind: "aircraft", target: "PRIVR", t: base - 5, az: 90, el: 30, range_m: 50000 }]);
+  assert.ok(a.ruvOf(b.nodeId, base) > 0); // a credited b locally from the wire provenance
+
+  // rUv lives only in a's ledger; nothing rUv- or location-shaped is on any wire
+  // Observation (only the coarse obsCell ever appears).
+  for (const o of a.remoteTracks().flatMap((tr) => tr.observations())) {
+    const keys = deepKeys(o);
+    for (const k of ["ruv", "rUv", "credit", "leaderboard", "uptime", "lat", "lon", "alt", "alt_m", "latitude", "longitude"]) {
+      assert.ok(!keys.includes(k), `wire leaked: ${k}`);
+    }
+    assert.match(o.obsCell, /^[0-9bcdefghjkmnpqrstuvwxyz]+$/); // only the coarse cell
+  }
+
+  a.dispose(); b.dispose();
+});

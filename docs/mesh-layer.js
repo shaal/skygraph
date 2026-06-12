@@ -28,6 +28,7 @@ import { AnomalyConsensus } from "../src/mesh/consensus.js";
 import { FederatedAnomalyModel } from "../src/mesh/fedmodel.js";
 import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
 import { ReputationLedger } from "../src/mesh/reputation.js";
+import { ContributionLedger } from "../src/mesh/ruv.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -102,6 +103,13 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // Observations fuses identically and computes the same scores (coordinator-free,
   // ADR-0005), so nothing new rides the wire (ADR-0007 holds).
   const reputation = new ReputationLedger();
+  // rUv contribution accounting (T4.2, ADR-0008): credit each nodeId for uptime +
+  // *unique* coverage (rarity-weighted so filling a gap beats piling onto a well-
+  // covered cell), with an early-adopter multiplier — a non-redeemable metric for
+  // the leaderboard. Fed from the SAME provenance every Observation already carries
+  // (coarse obsCell + nodeId + t — ADR-0007); like reputation it's derived locally
+  // and never gossiped, so every node computes the same board (coordinator-free).
+  const ruv = new ContributionLedger();
   // The time span (seconds) of a track's POSITIONED sources — the ones reputation
   // scores (those in `residuals`). Used to gate reputation on a co-temporal fuse
   // (see REP_CO_TEMPORAL_WINDOW_S). Infinity when the store has no such track.
@@ -124,6 +132,14 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     try {
       rf.ingest(obs);
     } catch { /* a hostile rf vote never breaks ingest */ }
+  }
+  function recordRuv(obs) {
+    // Credit this Observation's contributor (T4.2). `ingest` reads only the public
+    // obsCell/nodeId/t and is written not to throw, but — like recordRf — guard it
+    // so a pathological Observation can never throw into onObservation and stop delivery.
+    try {
+      ruv.ingest(obs);
+    } catch { /* a hostile Observation never breaks ingest */ }
   }
   function recordGradient(obs) {
     // Like recordVote/rememberEmbedding: `ingest` is written not to throw, but this
@@ -166,7 +182,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // + freshness) flow straight into the network store, keyed by target — into the
   // provenance DAG for tamper-evident first-seen, and into the shared novelty
   // memory if they carry a §13 embedding.
-  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); recordRf(obs); });
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); recordRf(obs); recordRuv(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -212,6 +228,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         recordVote(r.value); // our own anomaly flag is one of the corroborating votes
         recordGradient(r.value); // our own model update is one of the aggregated contributors
         recordRf(r.value); // our own RF-anomaly flag is one of the corroborating votes
+        recordRuv(r.value); // our own participation earns this node rUv too (T4.2)
 
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
@@ -365,6 +382,22 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     nodeReputations: (nowT = Math.floor(Date.now() / 1000)) => reputation.nodes({ nowT }),
     // Reputation roll-up for diagnostics/tests.
     reputationStats: () => ({ nodes: reputation.size, ...reputation.stats }),
+    // rUv contribution leaderboard (T4.2). The ranked board of contributors, each
+    // row { rank, nodeId, ruv, coverage, cells, uptime, earlyMult, firstSeen,
+    // earliest } — plus `isLocal` so the inset can badge "you". Sorted by rUv then
+    // nodeId (deterministic). `limit` trims to the top N for the inset. Empty until a
+    // node has earned a fresh credit, so the inset self-hides in the healthy idle case.
+    ruvLeaderboard: ({ nowT = Math.floor(Date.now() / 1000), limit } = {}) => {
+      const board = ruv.leaderboard(nowT, { limit });
+      return { ...board, rows: board.rows.map((r) => ({ ...r, isLocal: r.nodeId === identity.nodeId })) };
+    },
+    // One node's current rUv score — the headline metric for diagnostics / the panel.
+    ruvOf: (nodeId, nowT = Math.floor(Date.now() / 1000)) => ruv.ruvOf(nodeId, nowT),
+    // How many distinct nodes currently have a fresh rUv contribution — the headline
+    // "rUv Nn" count for the network-sky readout.
+    ruvContributors: (nowT = Math.floor(Date.now() / 1000)) => ruv.leaderboard(nowT).totals.nodes,
+    // rUv ledger roll-up for diagnostics/tests.
+    ruvStats: () => ({ nodes: ruv.size, ...ruv.stats }),
     // Edge detection for one of THIS node's live looks (T3.4). Folds the two reads
     // sky.js needs into one call so it never touches `src/mesh` or the coarse-cell
     // math directly: (1) the cell this aircraft is over and the network's RF verdict
@@ -396,7 +429,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // Age out stale state on the caller's cadence: the network store's sources AND
     // the consensus memory's votes (both keyed to the same freshness window, so a
     // target that drops off the sky also drops out of consensus).
-    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); reputation.prune(now); return s; },
+    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); reputation.prune(now); ruv.prune(now); return s; },
     // Cumulative transport + store counters, for diagnostics/tests.
     stats: () => ({ transport: transport.stats, store: store.stats }),
     dispose: () => { off(); transport.leave(); },
