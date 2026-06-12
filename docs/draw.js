@@ -161,6 +161,101 @@ export function drawNetworkTrack(ctx, view, w, h, opts = {}) {
   return true;
 }
 
+// Coverage heatmap inset (T2.2): a small geographic mini-map in the corner of
+// the dome answering "where does the network have eyes?". The dome itself is an
+// az/el sky view, but coverage is fundamentally a ground picture (nodes' coarse
+// cells on Earth), so it gets its own framed equirectangular inset rather than
+// being smeared onto the sky. `cov` is the structure from `buildCoverage`
+// (src/mesh/coverage.js): cells coloured by observation density, an N×N grid
+// whose empty bins are highlighted as gaps (unwatched regions), and the local
+// node badged distinctly. Self-contained — saves/restores all ctx state and
+// never touches the dome or its tracks (zero regression surface).
+const COVERAGE_PANEL = { w: 192, h: 152, margin: 12, pad: 8, header: 16, footer: 14 };
+
+export function drawCoverage(ctx, cov, w, h) {
+  const P = COVERAGE_PANEL;
+  if (w < P.w + 2 * P.margin || h < P.h + 2 * P.margin) return; // too cramped to read — skip
+  const x0 = w - P.w - P.margin, y0 = h - P.h - P.margin;
+  ctx.save();
+  // Panel chrome.
+  ctx.fillStyle = "rgba(13,18,32,0.86)";
+  ctx.strokeStyle = "#27345c";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.rect(x0, y0, P.w, P.h); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#7e90bd";
+  ctx.font = "bold 10px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText("NETWORK COVERAGE", x0 + P.pad, y0 + 11);
+
+  if (!cov || !cov.bounds || cov.cells.length === 0) {
+    ctx.fillStyle = "#3d4d78";
+    ctx.font = "10px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("no nodes yet", x0 + P.w / 2, y0 + P.h / 2);
+    ctx.restore();
+    return;
+  }
+
+  // Content rect + equirectangular projection (north up).
+  const cx0 = x0 + P.pad, cy0 = y0 + P.header;
+  const cw = P.w - 2 * P.pad, ch = P.h - P.header - P.footer;
+  const { minLat, maxLat, minLon, maxLon } = cov.bounds;
+  const lonSpan = (maxLon - minLon) || 1e-9, latSpan = (maxLat - minLat) || 1e-9;
+  const px = (lon) => cx0 + ((lon - minLon) / lonSpan) * cw;
+  const py = (lat) => cy0 + ((maxLat - lat) / latSpan) * ch;
+
+  // Gap grid: tint unwatched bins faint red so the holes in coverage read at a
+  // glance; faint lattice over the whole box for orientation.
+  const { rows, cols, bins } = cov.grid;
+  const bw = cw / cols, bh = ch / rows;
+  for (const b of bins) {
+    if (b.watched) continue;
+    ctx.fillStyle = "rgba(255,82,82,0.10)";
+    ctx.fillRect(cx0 + b.col * bw, cy0 + b.row * bh, bw, bh);
+  }
+  ctx.strokeStyle = "rgba(39,52,92,0.6)";
+  ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  for (let c = 0; c <= cols; c++) { ctx.moveTo(cx0 + c * bw, cy0); ctx.lineTo(cx0 + c * bw, cy0 + ch); }
+  for (let r = 0; r <= rows; r++) { ctx.moveTo(cx0, cy0 + r * bh); ctx.lineTo(cx0 + cw, cy0 + r * bh); }
+  ctx.stroke();
+
+  // Cells: a violet square per coarse cell, alpha ramped by observation density
+  // (the heatmap). Presence-only cells (nothing seen yet) still show at low
+  // alpha + an outline so an idle node's eye is visible. Local node badged.
+  const maxObs = cov.totals.maxCellObs;
+  for (const cell of cov.cells) {
+    const x = px(cell.lon), y = py(cell.lat);
+    const i = maxObs > 0 ? cell.observations / maxObs : 0;
+    ctx.fillStyle = `rgba(199,125,255,${(0.30 + 0.6 * i).toFixed(3)})`;
+    ctx.fillRect(x - 3, y - 3, 6, 6);
+    ctx.strokeStyle = NETWORK_COLOR;
+    ctx.lineWidth = 0.75;
+    ctx.strokeRect(x - 3, y - 3, 6, 6);
+    if (cell.isLocal) {
+      ctx.strokeStyle = LIVE_COLOR;
+      ctx.lineWidth = 1.25;
+      ctx.beginPath(); ctx.arc(x, y, 5.5, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+
+  // Footer roll-up. When the mesh reports more active nodes than we've located
+  // (an online peer that hasn't reported its cell yet), show "mapped/online" so
+  // the count is honest rather than silently disagreeing with the peer readout.
+  const { nodes, observations, gapBins, online } = cov.totals;
+  const nodeLabel = (online && online > nodes)
+    ? `${nodes}/${online} nodes`
+    : `${nodes} node${nodes === 1 ? "" : "s"}`;
+  ctx.fillStyle = "#7e90bd";
+  ctx.font = "9px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText(
+    `${nodeLabel} · ${observations} obs · ${gapBins} gap${gapBins === 1 ? "" : "s"}`,
+    x0 + P.pad, y0 + P.h - 5,
+  );
+  ctx.restore();
+}
+
 // Dashed red line between a conflicting pair (current display positions).
 export function drawConflictLine(ctx, pa, pb, w, h, label) {
   const [x1, y1, v1] = polarScreenXY(pa.az, pa.el, w, h);

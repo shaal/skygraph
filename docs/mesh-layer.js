@@ -21,6 +21,7 @@ import { createTransport } from "../src/mesh/transport.js";
 import { coarseCell, createIdentity, sign } from "../src/mesh/observation.js";
 import { NetworkTrackStore } from "../src/mesh/network-store.js";
 import { canonicalizeTracks } from "../src/mesh/fusion.js";
+import { buildCoverage } from "../src/mesh/coverage.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -93,6 +94,29 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // `residuals`. Pass the local observer so peers' tracks land where they
     // actually are in our sky, not at the peers' own (to us, meaningless) az/el.
     canonicalTracks: () => canonicalizeTracks(store.tracks(), { observer }),
+    // The coverage picture for the "where does the network have eyes?" heatmap
+    // (T2.2): every peer Observation's coarse cell + this node's own cell, folded
+    // into per-cell density + an N×N gap grid. `localObsCount` is how many local
+    // looks we're contributing right now (our own node still registers at 0 —
+    // presence). Only coarse cells are read — no raw lat/lon ever enters this
+    // (ADR-0007).
+    //
+    // A peer is placed once it has reported at least one Observation: its coarse
+    // cell rides on observations only, never on presence beacons, so an online-
+    // but-silent peer isn't on the map yet (locating it would mean putting cells
+    // on the presence plane — a separate privacy decision, not T2.2). We expose
+    // `online` (peers + self) so the readout can honestly show "mapped of online"
+    // instead of conflating the two counts.
+    coverage: ({ localObsCount = 0, grid } = {}) => {
+      const entries = [];
+      for (const track of store.tracks()) {
+        for (const obs of track.observations()) entries.push({ obsCell: obs.obsCell, nodeId: obs.nodeId });
+      }
+      entries.push({ obsCell, nodeId: identity.nodeId, count: localObsCount });
+      const cov = buildCoverage(entries, { localNodeId: identity.nodeId, grid });
+      cov.totals.online = transport.peers().length + 1; // active nodes (incl. self), mapped or not
+      return cov;
+    },
     remoteCount: () => store.size,
     publish,
     prune: () => store.prune(),

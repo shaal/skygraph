@@ -6,7 +6,7 @@ export const SETTINGS_KEY = "skygraph-settings-v1";
 const DEFAULTS = {
   aircraft: true, satellites: true, sunmoon: true, trails: true, labels: true,
   conflicts: true, trailLen: 150, webgpuSats: false, tleGroup: "visual",
-  view3d: false, networkSky: false,
+  view3d: false, networkSky: false, coverageHeatmap: false,
 };
 
 export const CFG = (() => {
@@ -66,6 +66,19 @@ export function initDrawer(handlers) {
     saveSettings();
     handlers.onTleGroup(sel.value);
   });
+
+  // Coverage heatmap (T2.2): a network feature — the inset only draws when the
+  // mesh actually loaded (the built app), but the toggle persists either way.
+  // Refresh immediately on enable so it appears without waiting for the 1 Hz tick.
+  const covBox = document.getElementById("opt-coverage");
+  if (covBox) {
+    covBox.checked = CFG.coverageHeatmap;
+    covBox.addEventListener("change", () => {
+      CFG.coverageHeatmap = covBox.checked;
+      saveSettings();
+      if (covBox.checked) handlers.onCoverage?.();
+    });
+  }
 
   // WebGPU toggle with automatic Canvas2D fallback on init failure.
   const gpuBox = document.getElementById("opt-webgpu");

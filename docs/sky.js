@@ -17,7 +17,7 @@ import { LiveFeed, displayPoint, syncLiveTable } from "./live-feed.js";
 import { moonPosition, satSunlit, sunPosition } from "./astro.js";
 import { scoreAll } from "./score-live.js";
 import {
-  BAND_COLORS, drawConflictLine, drawCone, drawNetworkTrack, drawSkyDome, drawTrack,
+  BAND_COLORS, drawConflictLine, drawCone, drawCoverage, drawNetworkTrack, drawSkyDome, drawTrack,
   LIVE_COLOR, SAT_COLOR, SAT_VISIBLE_COLOR,
 } from "./draw.js";
 import { CFG, initDrawer, saveSettings } from "./settings.js";
@@ -175,6 +175,18 @@ async function main() {
     }
   }
 
+  // Coverage heatmap (T2.2): a cached snapshot of "where the network has eyes",
+  // refreshed on the 1 Hz mesh tick (and immediately when toggled on) and drawn
+  // each frame — so the inset updates live without recomputing the grid at 60fps.
+  let coverageSnap = null;
+  function updateCoverage() {
+    if (!mesh || !CFG.coverageHeatmap) return;
+    // Our own contribution to density: how many local looks we'd gossip right
+    // now (0 during replay / aircraft off — but our node still has an eye here).
+    const localObsCount = localObservations(Math.floor(Date.now() / 1000)).length;
+    coverageSnap = mesh.coverage({ localObsCount });
+  }
+
   // --- Satellite layer (wasm SGP4; stays off without ./pkg) -------------------
   let satProp = null, satNames = [], satsAbove = [], passes = null;
   let satGen = 0;
@@ -257,6 +269,7 @@ async function main() {
   const drawerCtl = initDrawer({
     onWebgpu: setWebgpu,
     onTleGroup: (g) => loadSats(g),
+    onCoverage: () => updateCoverage(), // refresh the inset the moment it's toggled on
     onPassAlerts: async () => (passes ? passes.enableAlerts() : false),
     // Location controls. Each choice persists then reloads, so the whole
     // pipeline (ECEF, wasm projector, SGP4, feed search) re-inits cleanly
@@ -658,6 +671,8 @@ async function main() {
       satsAbove = [];
       if (gpu) gpu.draw(gpuInst, 0, w, h, dpr); // clear the overlay
     }
+    // Coverage inset last, so it sits above the dome + tracks (2D view only).
+    if (CFG.coverageHeatmap && mesh && coverageSnap) drawCoverage(ctx, coverageSnap, w, h);
   }
 
   // Build the signed-Observation drafts for what this node sees right now: its
@@ -740,6 +755,7 @@ async function main() {
         mesh.publish(localObservations(Math.floor(Date.now() / 1000))).catch(() => {});
       }
       if (CFG.networkSky) updateMeshReadout();
+      if (CFG.coverageHeatmap) updateCoverage();
     }, 1000);
     // Announce departure so peers' "N nodes online" reacts promptly to this tab
     // closing. beforeunload misses mobile/bfcache; pagehide covers those. leave()
