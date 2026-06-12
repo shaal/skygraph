@@ -26,6 +26,7 @@ import { ProvenanceDag } from "../src/mesh/dag.js";
 import { SharedNoveltyMemory } from "../src/mesh/shared-novelty.js";
 import { AnomalyConsensus } from "../src/mesh/consensus.js";
 import { FederatedAnomalyModel } from "../src/mesh/fedmodel.js";
+import { RfIntegrityMap, spoofVote } from "../src/mesh/rf-integrity.js";
 
 // One mesh for the whole app: a fixed bus + topic so every SkyGraph tab forms a
 // single network sky. The browser default is the BroadcastChannel simulator
@@ -74,6 +75,22 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // federated model is the Byzantine-robust (trimmed-mean) aggregate of all fresh
   // contributors, recomputed identically on every node (coordinator-free).
   const model = new FederatedAnomalyModel();
+  // RF-integrity map (T3.4): every Observation that carries a node's local RF-anomaly
+  // judgment (`payload.rf` = { kind:"spoof"|"jam", cell, score? }) — peers' AND our
+  // own publishes — becomes a vote, keyed by the affected coarse cell; a spoof/jam
+  // zone is "confirmed" only once k distinct nodes agree, turning one node's flag into
+  // a network-corroborated heat overlay (ADR-0006, "derives from cross-node
+  // disagreement + timing drift"). Reads only the public cell/nodeId; a malformed vote
+  // is ignored by `ingest`.
+  const rf = new RfIntegrityMap();
+  function recordRf(obs) {
+    // Like recordVote/recordGradient: `ingest` is written not to throw, but this step
+    // has no internal error boundary the transport relies on, so guard it — a
+    // pathological `payload.rf` must never throw into onObservation and stop delivery.
+    try {
+      rf.ingest(obs);
+    } catch { /* a hostile rf vote never breaks ingest */ }
+  }
   function recordGradient(obs) {
     // Like recordVote/rememberEmbedding: `ingest` is written not to throw, but this
     // step has no internal error boundary the transport relies on, so guard it — a
@@ -115,7 +132,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
   // + freshness) flow straight into the network store, keyed by target — into the
   // provenance DAG for tamper-evident first-seen, and into the shared novelty
   // memory if they carry a §13 embedding.
-  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); });
+  const off = transport.onObservation((obs) => { store.ingest(obs); anchor(obs); rememberEmbedding(obs); recordVote(obs); recordGradient(obs); recordRf(obs); });
 
   // Publish a batch of local looks as signed Observations. `drafts` are plain
   // per-target fields ({ kind, target, t, az, el, range_m?, payload? }); we add
@@ -160,6 +177,8 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
         rememberEmbedding(r.value);
         recordVote(r.value); // our own anomaly flag is one of the corroborating votes
         recordGradient(r.value); // our own model update is one of the aggregated contributors
+        recordRf(r.value); // our own RF-anomaly flag is one of the corroborating votes
+
         try { await transport.publish(r.value); sent++; } catch { /* wire hiccup */ }
       }
       return sent;
@@ -267,6 +286,44 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     fedContributors: (nowT = Math.floor(Date.now() / 1000)) => model.aggregate(nowT)?.contributors ?? 0,
     // Model roll-up for diagnostics/tests.
     modelStats: () => ({ contributors: model.contributorCount, examples: model.exampleCount, ...model.stats }),
+    // RF-integrity overlay (T3.4). The render-ready heat map of spoof/jam zones: each
+    // active cell decoded to its lat/lon centre with a corroboration intensity, plus a
+    // padded lat/lon box — drawn by draw.js's `drawRfIntegrity` inset. Empty (cells:[])
+    // until a zone is flagged, so the inset stays invisible in the healthy case.
+    rfHeatmap: ({ nowT = Math.floor(Date.now() / 1000) } = {}) => rf.heatmap({ nowT }),
+    // The RF-integrity verdict for one coarse cell — null if no node has flagged it,
+    // else { kind, nodes, confirmed, k, intensity, ... } so the detail panel can say
+    // whether an aircraft sits in a confirmed spoof/jam zone or a single-node suspicion.
+    rfStatus: (cell, nowT = Math.floor(Date.now() / 1000)) => rf.zoneStatus(cell, { nowT }),
+    // How many spoof/jam zones are currently confirmed (k+ distinct nodes agree) — the
+    // headline "RF N zones" count for the network-sky readout.
+    rfConfirmedZones: (nowT = Math.floor(Date.now() / 1000)) => rf.confirmedCount(nowT),
+    // RF map roll-up for diagnostics/tests.
+    rfStats: () => ({ zones: rf.size, ...rf.stats }),
+    // Edge detection for one of THIS node's live looks (T3.4). Folds the two reads
+    // sky.js needs into one call so it never touches `src/mesh` or the coarse-cell
+    // math directly: (1) the cell this aircraft is over and the network's RF verdict
+    // there (`status`, for the detail panel / badge); (2) a `vote` to gossip when the
+    // broadcast look grossly disagrees with the network's INDEPENDENT fused position
+    // for the same target (cross-node disagreement → spoof candidate). `fused` is the
+    // canonical track for this target (from canonicalTracks), or absent when no peer
+    // corroborates it — then there's no independent reference and `vote` is null.
+    // Only coarse cells are derived (ADR-0007); raw lat/lon never leaves here.
+    localRf: ({ lat, lon, az, el, fused } = {}, nowT = Math.floor(Date.now() / 1000)) => {
+      // Range-guard before coarseCell: the live feed only type-checks lat/lon, so a
+      // garbled/hostile row (e.g. lat 999) would otherwise throw out of coarseCell and
+      // — with no error boundary upstream — abort the whole feed update. Out-of-range
+      // ⇒ no cell ⇒ no verdict/vote, never a throw.
+      if (!Number.isFinite(lat) || lat < -90 || lat > 90 ||
+          !Number.isFinite(lon) || lon < -180 || lon > 180) return null;
+      const cell = coarseCell(lat, lon);
+      const status = rf.zoneStatus(cell, { nowT });
+      let vote = null;
+      if (fused && Number.isFinite(az) && Number.isFinite(el)) {
+        vote = spoofVote({ broadcast: { az, el }, fused: { az: fused.az, el: fused.el }, cell, sources: fused.sourceCount });
+      }
+      return { cell, status, vote };
+    },
     // Await all in-flight DAG anchors (anchoring is async on the live path).
     // Lets a caller read a settled provenance view right after publishing.
     idle: () => Promise.all([...pendingAnchors]),
@@ -274,7 +331,7 @@ export async function startMeshLayer({ observer, kind = "sim", busId = BUS_ID, t
     // Age out stale state on the caller's cadence: the network store's sources AND
     // the consensus memory's votes (both keyed to the same freshness window, so a
     // target that drops off the sky also drops out of consensus).
-    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); return s; },
+    prune: () => { const s = store.prune(); const now = Math.floor(Date.now() / 1000); consensus.prune(now); model.prune(now); rf.prune(now); return s; },
     // Cumulative transport + store counters, for diagnostics/tests.
     stats: () => ({ transport: transport.stats, store: store.stats }),
     dispose: () => { off(); transport.leave(); },

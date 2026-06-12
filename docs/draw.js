@@ -256,6 +256,102 @@ export function drawCoverage(ctx, cov, w, h) {
   ctx.restore();
 }
 
+// RF-integrity heat overlay (T3.4): a small geographic inset — sibling of the
+// coverage map — answering "where is the network seeing GPS spoofing/jamming?".
+// Like coverage, spoof/jam is a GROUND picture (the coarse cells of affected
+// regions), so it gets its own framed equirectangular inset rather than being
+// smeared onto the az/el dome. `hm` is the structure from RfIntegrityMap.heatmap()
+// (src/mesh/rf-integrity.js): one square per active zone, coloured by kind
+// (spoof = red, jam = amber) and alpha-ramped by cross-node corroboration
+// intensity, with confirmed (k+-node) zones outlined brightly and single-node
+// "suspected" zones left faint. Placed bottom-LEFT so it never collides with the
+// bottom-right coverage inset. Self-contained — saves/restores all ctx state and
+// only draws when a zone is actually active, so it's invisible until something
+// lights up (the common, healthy case). Zero effect on the dome or its tracks.
+const RF_PANEL = { w: 192, h: 142, margin: 12, pad: 8, header: 16, footer: 14 };
+const RF_KIND_COLOR = { spoof: "#ff5252", jam: "#ff9f43" };
+const RF_KIND_FALLBACK = "#ffd166";
+
+export function drawRfIntegrity(ctx, hm, w, h) {
+  if (!hm || !hm.bounds || !hm.cells || hm.cells.length === 0) return; // nothing lit — stay invisible
+  const P = RF_PANEL;
+  if (w < P.w + 2 * P.margin || h < P.h + 2 * P.margin) return; // too cramped to read — skip
+  const x0 = P.margin, y0 = h - P.h - P.margin; // bottom-left (coverage owns bottom-right)
+  ctx.save();
+  // Panel chrome — a faint red tint so the box itself reads as an alert.
+  ctx.fillStyle = "rgba(26,13,15,0.88)";
+  ctx.strokeStyle = "#5a2730";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.rect(x0, y0, P.w, P.h); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#e08a90";
+  ctx.font = "bold 10px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText("⚠ RF INTEGRITY", x0 + P.pad, y0 + 11);
+
+  // Content rect + equirectangular projection (north up), same mapping as coverage.
+  const cx0 = x0 + P.pad, cy0 = y0 + P.header;
+  const cw = P.w - 2 * P.pad, ch = P.h - P.header - P.footer;
+  const { minLat, maxLat, minLon, maxLon } = hm.bounds;
+  const lonSpan = (maxLon - minLon) || 1e-9, latSpan = (maxLat - minLat) || 1e-9;
+  const px = (lon) => cx0 + ((lon - minLon) / lonSpan) * cw;
+  const py = (lat) => cy0 + ((maxLat - lat) / latSpan) * ch;
+
+  // Faint lattice for orientation.
+  ctx.strokeStyle = "rgba(90,39,48,0.5)";
+  ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  for (let c = 0; c <= 4; c++) { ctx.moveTo(cx0 + (c / 4) * cw, cy0); ctx.lineTo(cx0 + (c / 4) * cw, cy0 + ch); }
+  for (let r = 0; r <= 4; r++) { ctx.moveTo(cx0, cy0 + (r / 4) * ch); ctx.lineTo(cx0 + cw, cy0 + (r / 4) * ch); }
+  ctx.stroke();
+
+  // One heat square per zone: colour by kind, alpha by corroboration intensity.
+  // Confirmed zones (k+ nodes) get a bright outline + a glow ring so they clearly
+  // "light up"; single-node suspected zones stay faint and unoutlined.
+  for (const z of hm.cells) {
+    if (!Number.isFinite(z.lat) || !Number.isFinite(z.lon)) continue; // never plot NaN
+    const x = px(z.lon), y = py(z.lat);
+    const col = RF_KIND_COLOR[z.kind] || RF_KIND_FALLBACK;
+    const inten = Number.isFinite(z.intensity) ? z.intensity : 0;
+    const a = (0.25 + 0.55 * Math.max(0, Math.min(1, inten))).toFixed(3);
+    ctx.fillStyle = withAlpha(col, a);
+    ctx.fillRect(x - 4, y - 4, 8, 8);
+    if (z.confirmed) {
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1.25;
+      ctx.strokeRect(x - 4.5, y - 4.5, 9, 9);
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.strokeStyle = withAlpha(col, "0.45");
+      ctx.lineWidth = 0.75;
+      ctx.strokeRect(x - 4.5, y - 4.5, 9, 9);
+    }
+  }
+
+  // Footer roll-up: confirmed vs total zones lit. Defaulted so a heatmap missing its
+  // totals can never throw out of the render loop (drawRfIntegrity is called from the
+  // rAF tick with no surrounding try/catch — it must be its own bulletproof boundary).
+  const { zones = hm.cells.length, confirmed = 0 } = hm.totals || {};
+  ctx.fillStyle = "#e08a90";
+  ctx.font = "9px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText(
+    `${confirmed} confirmed · ${zones} zone${zones === 1 ? "" : "s"}`,
+    x0 + P.pad, y0 + P.h - 5,
+  );
+  ctx.restore();
+}
+
+// "#rrggbb" + alpha string → "rgba(r,g,b,a)". Tiny helper so the RF inset can ramp
+// a named kind colour by intensity without per-call colour math at the call site.
+function withAlpha(hex, a) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
 // Dashed red line between a conflicting pair (current display positions).
 export function drawConflictLine(ctx, pa, pb, w, h, label) {
   const [x1, y1, v1] = polarScreenXY(pa.az, pa.el, w, h);

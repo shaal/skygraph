@@ -42,6 +42,14 @@ const FIXED_TARGET = params.get("target") || "";
 const FIXED_RANGE = params.has("range") ? Number(params.get("range")) : null;
 const FIXED_AZ = params.has("az") ? Number(params.get("az")) : null;
 const FIXED_EL = params.has("el") ? Number(params.get("el")) : null;
+// T3.4 RF-integrity injection. `?rf=spoof` or `?rf=jam` makes every publish carry a
+// `payload.rf` vote for an affected zone, so a spoof/jam scenario can be injected
+// into the live app: open 2+ tabs with e.g.
+//   ?bus=skygraph-edgenet&topic=all-sky&rf=spoof
+// (the app's bus/topic) and the app's RfIntegrityMap confirms the zone (k distinct
+// nodes) and its RF-integrity inset lights up. `?rfcell=` pins the affected coarse
+// cell (default: this node's own OBS_CELL, so co-located sim tabs hit one zone).
+const RF_KIND = params.get("rf") || "";
 
 // A node sits a little way from a shared base point so the mesh looks like
 // several real observers in one area; only the coarse cell ever leaves the node.
@@ -79,6 +87,14 @@ async function makeObservation() {
     obsCell: OBS_CELL,
   };
   if (FIXED_RANGE != null && Number.isFinite(FIXED_RANGE)) draft.range_m = FIXED_RANGE;
+  // T3.4: attach an RF-integrity vote so this tab corroborates a spoof/jam zone. The
+  // affected cell defaults to a FIXED demo cell (the shared BASE point, not this tab's
+  // own jittered location) so two tabs without `?rfcell=` still vote for the SAME zone
+  // and confirm it — and so the demo never keys a zone off an observer's home cell.
+  if (RF_KIND === "spoof" || RF_KIND === "jam") {
+    const cell = params.get("rfcell") || coarseCell(BASE.lat, BASE.lon);
+    draft.payload = { ...(draft.payload || {}), rf: { kind: RF_KIND, cell, target } };
+  }
   return sign(draft, identity);
 }
 

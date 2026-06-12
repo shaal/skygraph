@@ -17,8 +17,8 @@ import { LiveFeed, displayPoint, syncLiveTable } from "./live-feed.js";
 import { moonPosition, satSunlit, sunPosition } from "./astro.js";
 import { scoreAll } from "./score-live.js";
 import {
-  BAND_COLORS, drawConflictLine, drawCone, drawCoverage, drawNetworkTrack, drawSkyDome, drawTrack,
-  LIVE_COLOR, SAT_COLOR, SAT_VISIBLE_COLOR,
+  BAND_COLORS, drawConflictLine, drawCone, drawCoverage, drawNetworkTrack, drawRfIntegrity,
+  drawSkyDome, drawTrack, LIVE_COLOR, SAT_COLOR, SAT_VISIBLE_COLOR,
 } from "./draw.js";
 import { CFG, initDrawer, saveSettings } from "./settings.js";
 import { renderDetails, renderSatTable } from "./panels.js";
@@ -187,6 +187,16 @@ async function main() {
     coverageSnap = mesh.coverage({ localObsCount });
   }
 
+  // RF-integrity heat overlay (T3.4): a cached snapshot of the spoof/jam zones the
+  // network currently corroborates, refreshed on the 1 Hz mesh tick and drawn each
+  // frame as a bottom-left inset. No toggle — the inset self-hides until a zone
+  // lights up (cells:[] in the healthy case), so it's a passive alert, not clutter.
+  let rfSnap = null;
+  function updateRf() {
+    if (!mesh) return;
+    rfSnap = mesh.rfHeatmap();
+  }
+
   // --- Satellite layer (wasm SGP4; stays off without ./pkg) -------------------
   let satProp = null, satNames = [], satsAbove = [], passes = null;
   let satGen = 0;
@@ -350,6 +360,9 @@ async function main() {
     // Federated model (T3.3): how many distinct nodes currently contribute a fresh
     // update to the shared anomaly adapter (our own publish counts as one).
     const fedNodes = mesh.fedContributors ? mesh.fedContributors() : 0;
+    // RF-integrity (T3.4): how many GPS spoof/jam zones k+ distinct nodes currently
+    // corroborate — the headline count for the heat overlay.
+    const rfZones = mesh.rfConfirmedZones ? mesh.rfConfirmedZones() : 0;
     meshReadout.textContent =
       `◉ ${nodes} node${nodes === 1 ? "" : "s"} online · ` +
       `${remote} remote track${remote === 1 ? "" : "s"}` +
@@ -357,6 +370,7 @@ async function main() {
       (memSize ? ` · mem ${memSize} emb` : "") +
       (confirmed ? ` · ⚠ ${confirmed} confirmed` : "") +
       (fedNodes ? ` · model ${fedNodes}n` : "") +
+      (rfZones ? ` · RF ${rfZones} zone${rfZones === 1 ? "" : "s"}` : "") +
       (nodes === 1 ? " · open another tab to mesh" : "");
   }
   function applySky(on) {
@@ -560,6 +574,33 @@ async function main() {
         tr.fedScore = mesh.federatedScore(tr._emb, nowSec);
       }
     }
+    // RF-integrity (T3.4): for each local aircraft, ask the mesh (a) the network's RF
+    // verdict for the cell it's over — so the panel can flag an aircraft sitting in a
+    // confirmed spoof/jam zone — and (b) whether its BROADCAST look grossly disagrees
+    // with the network's INDEPENDENT fused position for the same target (cross-node
+    // disagreement → a spoof vote we'll gossip in localObservations). The fused
+    // reference is the canonical track from OTHER nodes; absent (no corroboration) ⇒
+    // no vote, so a solo node never accuses itself.
+    if (mesh) {
+      // Wrapped so an unexpected throw here (a hostile peer track, a bad feed row)
+      // can never abort onFeedUpdate before scoring/render — the same "never break the
+      // pipeline" guarantee the mesh ingest paths hold (mesh-layer.js).
+      try {
+        const nowSec = Math.floor(nowT);
+        const canon = new Map();
+        for (const c of mesh.canonicalTracks({ nowT: nowSec })) canon.set(c.target, c);
+        for (const tr of f.trackList) {
+          tr.rfIntegrity = null;
+          tr._rfVote = null;
+          const p = tr.points.length ? tr.points[tr.points.length - 1] : null;
+          if (!p || !Number.isFinite(p.lat) || !Number.isFinite(p.lon)) continue;
+          const info = mesh.localRf({ lat: p.lat, lon: p.lon, az: p.az, el: p.el, fused: canon.get(tr.icao24) }, nowSec);
+          if (!info) continue;
+          tr.rfIntegrity = info.status;
+          tr._rfVote = info.vote;
+        }
+      } catch { /* RF-integrity is best-effort; never let it break the feed update */ }
+    }
     detectBehaviors(f.trackList, nowT);       // HOLD / GRID / GO-AROUND / FORM
     conflicts = CFG.conflicts ? detectConflicts(f.trackList, nowT) : [];
     recorder.record(f.trackList, nowT);       // replay ring buffer (~1 h)
@@ -727,6 +768,9 @@ async function main() {
     }
     // Coverage inset last, so it sits above the dome + tracks (2D view only).
     if (CFG.coverageHeatmap && mesh && coverageSnap) drawCoverage(ctx, coverageSnap, w, h);
+    // RF-integrity inset (T3.4), bottom-left: spoof/jam zones the network detects.
+    // Self-hides when nothing is flagged, so it's drawn whenever the mesh is up.
+    if (mesh && rfSnap) drawRfIntegrity(ctx, rfSnap, w, h);
   }
 
   // Build the signed-Observation drafts for what this node sees right now: its
@@ -768,6 +812,12 @@ async function main() {
       if (tr.anomaly && (tr.anomaly.band === "strong anomaly" || tr.anomaly.band === "rare")) {
         payload.anomaly = { kind: "anomaly", score: Math.round(tr.anomaly.score * 1e3) / 1e3 };
       }
+      // RF-integrity vote (T3.4): set in onFeedUpdate when this aircraft's broadcast
+      // look grossly disagrees with the network's independent fused position (cross-
+      // node disagreement). Carries only the kind, the target's COARSE cell, and the
+      // separation as a score — never observer data (ADR-0007). A zone is "confirmed"
+      // only once k distinct nodes vote (mesh-layer's RfIntegrityMap).
+      if (tr._rfVote) payload.rf = tr._rfVote;
       if (Object.keys(payload).length) d.payload = payload;
       out.push(d);
     }
@@ -852,6 +902,7 @@ async function main() {
       }
       if (CFG.networkSky) updateMeshReadout();
       if (CFG.coverageHeatmap) updateCoverage();
+      updateRf(); // RF-integrity inset refresh — cheap, self-hides when no zone is lit
     }, 1000);
     // Announce departure so peers' "N nodes online" reacts promptly to this tab
     // closing. beforeunload misses mobile/bfcache; pagehide covers those. leave()

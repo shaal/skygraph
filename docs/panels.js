@@ -114,6 +114,17 @@ export function renderDetails(v) {
     lines.push(`federated anomaly ${tr.fedScore.toFixed(2)} — linear adapter over §13, ` +
       `${v.fedModelNodes}-node model (mesh)`);
   }
+  // RF-integrity (T3.4): when the network flags the coarse cell this aircraft is over
+  // as a GPS spoof/jam zone, say whether k+ distinct nodes corroborate it (confirmed)
+  // or it's still a single-node suspicion. Absent (null) ⇒ no flag / no mesh, so the
+  // line simply doesn't show.
+  if (tr.rfIntegrity) {
+    const z = tr.rfIntegrity;
+    const what = z.kind === "jam" ? "GPS jamming" : z.kind === "spoof" ? "GPS spoofing" : "RF anomaly";
+    lines.push(z.confirmed
+      ? `⚠ ${what} zone · corroborated by ${z.nodes} node${z.nodes === 1 ? "" : "s"} (mesh)`
+      : `${esc(what)} suspected · ${z.nodes}/${z.k} nodes (mesh)`);
+  }
   details.innerHTML = who +
     lines.map((l) => line(l, tr.emergency ? "#ff5252" : c)).join("");
 }
