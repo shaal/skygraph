@@ -11,6 +11,7 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { drawBasemap, onTilesLoaded } from "./basemap.js";
 
 const DEG = Math.PI / 180;
 const DOME_R = 100;          // world radius of the horizon ring / sky dome
@@ -20,6 +21,7 @@ const COL = {
   aircraft: 0x5aa9ff, selected: 0xffffff, drop: 0x5aa9ff,
   network: 0xc77dff, // peers' "network sky" tracks (T1.4); matches NETWORK_COLOR in draw.js
 };
+const COL_BG = new THREE.Color(0x060812); // scene clear colour — trails fade toward it
 
 // az (deg, 0 = North, clockwise) + el (deg, 0 = horizon, 90 = zenith) -> a
 // point at `radius` in the local ENU frame mapped to three's Y-up world:
@@ -78,13 +80,17 @@ export class Sky3D {
     this._tmp = new THREE.Vector3();
     this._pick = { aircraft: [], sats: [], remote: [] }; // world positions + refs for click picking
     this._labels = [];                        // pooled label sprites
+    this._trails = [];                        // pooled past-path polylines (one per aircraft)
+    this._pred = null;                        // selected aircraft's predicted-path cone (3 lines)
     this._onSelectAircraft = null;
     this._onSelectSat = null;
   }
 
-  init(canvas, { onSelectAircraft, onSelectSat } = {}) {
+  init(canvas, { onSelectAircraft, onSelectSat, observer, cfg } = {}) {
     this._onSelectAircraft = onSelectAircraft;
     this._onSelectSat = onSelectSat;
+    this._observer = observer || null; // ground-map centre
+    this._cfg = cfg || null;           // live basemap enable/opacity/style
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setClearColor(0x060812, 1);
@@ -110,6 +116,7 @@ export class Sky3D {
 
     this._buildDome();
     this._buildGround();
+    this._buildBasemapGround();
     this._buildCardinals();
 
     this._disc = discTexture();
@@ -120,6 +127,7 @@ export class Sky3D {
     this._sun = this._makeGlow(COL.sun, 6);
     this._moon = this._makeGlow(COL.moon, 4.5);
     this._drop = this._makeDropLine();
+    this._buildPrediction();
 
     // Click-to-select, but not while orbiting: record the press, and only
     // pick if the pointer barely moved before release (a drag rotates).
@@ -155,6 +163,47 @@ export class Sky3D {
     grid.material.transparent = true;
     grid.material.opacity = 0.5;
     this.scene.add(grid);
+  }
+
+  // A faint geographic disc on the ground plane, textured by the SAME basemap
+  // renderer the 2D dome uses (drawn into an offscreen canvas). The disc lies
+  // flat under the sky so the map's north/east align with the scene's -z/+x.
+  _buildBasemapGround() {
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = 1024;
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.35, depthWrite: false });
+    const mesh = new THREE.Mesh(new THREE.CircleGeometry(DOME_R, 96), mat);
+    mesh.rotation.x = -Math.PI / 2; // flat: texture top->North (-z), right->East (+x)
+    mesh.position.y = 0.1;          // just above the polar grid
+    mesh.renderOrder = -1;
+    mesh.visible = false;
+    this.scene.add(mesh);
+    this._ground = mesh; this._groundTex = tex; this._groundCanvas = cv; this._groundStyle = null;
+    this._refreshGround();
+    this._unsubBasemap = onTilesLoaded(() => this._refreshGround());
+  }
+
+  // Recomposite the offscreen map canvas (on tile load, or a style change).
+  _refreshGround() {
+    if (!this._groundCanvas || !this._observer) return;
+    const cv = this._groundCanvas, ctx = cv.getContext("2d");
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const style = (this._cfg && this._cfg.basemapStyle) || "dark";
+    drawBasemap(ctx, {
+      cx: cv.width / 2, cy: cv.height / 2, radiusPx: cv.width / 2,
+      lat: this._observer.lat, lon: this._observer.lon, style, opacity: 1, clip: "circle",
+    });
+    this._groundStyle = style;
+    this._groundTex.needsUpdate = true;
+  }
+
+  // Re-center the ground basemap on a new observer (live relocate, no reload).
+  setObserver(obs) {
+    if (obs) this._observer = obs;
+    this._refreshGround();
   }
 
   _buildCardinals() {
@@ -202,7 +251,7 @@ export class Sky3D {
   }
 
   // --- per-frame update ------------------------------------------------------
-  update({ aircraft = [], sats = [], remote = [], sun, moon, showLabels = false } = {}) {
+  update({ aircraft = [], sats = [], remote = [], sun, moon, showLabels = false, trails = null, predicted = null } = {}) {
     if (!this.ready) return;
     this._pick.aircraft.length = 0;
     this._pick.sats.length = 0;
@@ -231,7 +280,103 @@ export class Sky3D {
       this._drop.visible = false;
     }
 
+    this._updateTrails(trails);
+    this._updatePrediction(predicted);
     this._updateLabels(aircraft, sats, sun, moon, showLabels);
+  }
+
+  // --- past-path trails + predicted path -------------------------------------
+  _makeTrailLine() {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(6), 3));
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0.75, depthWrite: false,
+    }));
+    line.frustumCulled = false; // partial draw-range + pole-clipped points
+    line.visible = false;
+    this.scene.add(line);
+    return line;
+  }
+
+  // Each aircraft's recent az/el/range samples as a polyline whose colour fades
+  // toward the background at the old end — the WebGL echo of the 2D fading trail.
+  _updateTrails(trails) {
+    const list = Array.isArray(trails) ? trails : [];
+    while (this._trails.length < list.length) this._trails.push(this._makeTrailLine());
+    const bg = COL_BG, c = new THREE.Color();
+    for (let i = 0; i < this._trails.length; i++) {
+      const line = this._trails[i], t = list[i];
+      if (!t || !t.pts || t.pts.length < 2) { line.visible = false; continue; }
+      const n = t.pts.length, geo = line.geometry;
+      if (geo.attributes.position.count < n) {
+        geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+        geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+      }
+      const pos = geo.attributes.position.array, col = geo.attributes.color.array;
+      c.set(t.color ?? COL.aircraft);
+      for (let k = 0; k < n; k++) {
+        const p = t.pts[k];
+        azElToVec3(p.az, p.el, depthRadius(p.range), this._tmp);
+        pos[k * 3] = this._tmp.x; pos[k * 3 + 1] = this._tmp.y; pos[k * 3 + 2] = this._tmp.z;
+        const fade = n > 1 ? 1 - k / (n - 1) : 0; // oldest sample (k=0) most faded
+        col[k * 3] = c.r + (bg.r - c.r) * fade;
+        col[k * 3 + 1] = c.g + (bg.g - c.g) * fade;
+        col[k * 3 + 2] = c.b + (bg.b - c.b) * fade;
+      }
+      geo.setDrawRange(0, n);
+      geo.attributes.position.needsUpdate = true;
+      geo.attributes.color.needsUpdate = true;
+      geo.computeBoundingSphere();
+      line.material.opacity = t.selected ? 0.95 : 0.7;
+      line.visible = true;
+    }
+  }
+
+  _buildPrediction() {
+    const mk = (dashed, opacity) => {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+      const mat = dashed
+        ? new THREE.LineDashedMaterial({ color: 0xffffff, transparent: true, opacity, dashSize: 2.5, gapSize: 2.5, depthWrite: false })
+        : new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity, depthWrite: false });
+      const line = new THREE.Line(geo, mat);
+      line.frustumCulled = false; line.visible = false;
+      this.scene.add(line);
+      return line;
+    };
+    // center solid + bright, left/right dashed + faint — mirrors the 2D drawCone.
+    this._pred = { center: mk(false, 0.9), left: mk(true, 0.5), right: mk(true, 0.5) };
+  }
+
+  _updatePrediction(pred) {
+    if (!this._pred) return;
+    const fill = (line, pts, color) => {
+      // Clip at the horizon (not just below it) so the forecast never dives into
+      // the ground plane — the main cause of the "about to crash" look in 3D.
+      const valid = (pts || []).filter((p) => p.el > 2 && Number.isFinite(p.range));
+      if (valid.length < 2) { line.visible = false; return; }
+      const geo = line.geometry;
+      if (geo.attributes.position.count < valid.length) {
+        geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(valid.length * 3), 3));
+      }
+      const pos = geo.attributes.position.array;
+      for (let k = 0; k < valid.length; k++) {
+        azElToVec3(valid[k].az, valid[k].el, depthRadius(valid[k].range), this._tmp);
+        pos[k * 3] = this._tmp.x; pos[k * 3 + 1] = this._tmp.y; pos[k * 3 + 2] = this._tmp.z;
+      }
+      geo.setDrawRange(0, valid.length);
+      geo.attributes.position.needsUpdate = true;
+      geo.computeBoundingSphere();
+      if (line.material.isLineDashedMaterial) line.computeLineDistances();
+      line.material.color.set(color);
+      line.visible = true;
+    };
+    if (!pred) { this._pred.center.visible = this._pred.left.visible = this._pred.right.visible = false; return; }
+    const color = pred.color ?? 0xffffff;
+    fill(this._pred.center, pred.center, color);
+    fill(this._pred.left, pred.left, color);
+    fill(this._pred.right, pred.right, color);
   }
 
   // Pack az/el/range entities into a Points cloud; returns the selected one's
@@ -358,12 +503,20 @@ export class Sky3D {
     if (!this.ready) return;
     this.resize();
     this.controls.update();
+    // Live basemap state (read from the shared CFG every frame).
+    if (this._ground && this._cfg) {
+      const on = !!this._cfg.basemap && this._cfg.basemapOpacity > 0;
+      this._ground.visible = on;
+      this._ground.material.opacity = (this._cfg.basemapOpacity ?? 35) / 100;
+      if (on && this._cfg.basemapStyle !== this._groundStyle) this._refreshGround();
+    }
     this.renderer.render(this.scene, this.camera);
   }
 
   dispose() {
     if (!this.ready) return;
     this.ready = false;
+    this._unsubBasemap?.();
     this.controls.dispose();
     this.renderer.dispose();
     this.scene.traverse((o) => {

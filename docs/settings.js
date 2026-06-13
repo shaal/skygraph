@@ -2,11 +2,14 @@
 // New v2 keys: conflicts (CPA layer), webgpuSats (experimental satellite
 // renderer), tleGroup (CelesTrak group — starlink gated on WebGPU).
 
+import { setProjection } from "./project.js";
+
 export const SETTINGS_KEY = "skygraph-settings-v1";
 const DEFAULTS = {
   aircraft: true, satellites: true, sunmoon: true, trails: true, labels: true,
   conflicts: true, trailLen: 150, webgpuSats: false, tleGroup: "visual",
   view3d: false, networkSky: false, coverageHeatmap: false, leaderboard: false,
+  basemap: true, basemapOpacity: 35, basemapStyle: "dark", projection: "fisheye",
 };
 
 export const CFG = (() => {
@@ -91,6 +94,72 @@ export function initDrawer(handlers) {
       saveSettings();
       if (lbBox.checked) handlers.onLeaderboard?.();
     });
+  }
+
+  // Faint background map (2D dome + 3D ground). The render loop reads these CFG
+  // values live every frame, so no handler/redraw plumbing is needed — just
+  // persist. Opacity and style apply instantly to both views.
+  const mapBox = document.getElementById("opt-basemap");
+  if (mapBox) {
+    mapBox.checked = CFG.basemap;
+    mapBox.addEventListener("change", () => { CFG.basemap = mapBox.checked; saveSettings(); });
+  }
+  const mapOp = document.getElementById("opt-basemap-opacity");
+  const mapOpOut = document.getElementById("opt-basemap-out");
+  if (mapOp && mapOpOut) {
+    mapOp.value = String(CFG.basemapOpacity);
+    mapOpOut.textContent = String(CFG.basemapOpacity);
+    mapOp.addEventListener("input", () => {
+      CFG.basemapOpacity = Number(mapOp.value);
+      mapOpOut.textContent = mapOp.value;
+      saveSettings();
+    });
+  }
+  const mapStyle = document.getElementById("opt-basemap-style");
+  if (mapStyle) {
+    mapStyle.value = CFG.basemapStyle;
+    mapStyle.addEventListener("change", () => { CFG.basemapStyle = mapStyle.value; saveSettings(); });
+  }
+
+  // 2D dome projection (project.js holds the active mode; polarScreenXY reads it
+  // every frame, so the dome re-laws itself instantly). Apply the saved choice
+  // now so the first frame already uses it.
+  setProjection(CFG.projection);
+  const projSel = document.getElementById("opt-projection");
+  if (projSel) {
+    projSel.value = CFG.projection;
+    projSel.addEventListener("change", () => {
+      CFG.projection = projSel.value;
+      saveSettings();
+      setProjection(CFG.projection);
+    });
+  }
+
+  // "Go to place" — relocate the viewpoint by free-text address or "lat, lon".
+  // Geocoding is free + keyless (Photon/OSM) via handlers.onSearchLocation,
+  // which saves the observer and reloads (same path as the manual lat/lon fields).
+  const placeIn = document.getElementById("opt-place");
+  const placeGo = document.getElementById("opt-place-go");
+  if (placeIn && placeGo) {
+    const search = async () => {
+      const q = placeIn.value.trim();
+      if (!q) return;
+      placeGo.disabled = true;
+      const restore = placeGo.textContent;
+      placeGo.textContent = "…";
+      const ok = await handlers.onSearchLocation?.(q);
+      if (ok === false) { // not found — flag, keep the query, let them retry
+        placeGo.disabled = false;
+        placeGo.textContent = restore;
+        placeIn.style.borderColor = "var(--warn)";
+        placeIn.value = "";
+        placeIn.placeholder = "not found — try another";
+      }
+      // on success the page reloads, so no success branch is needed
+    };
+    placeGo.addEventListener("click", search);
+    placeIn.addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+    placeIn.addEventListener("input", () => { placeIn.style.borderColor = ""; });
   }
 
   // WebGPU toggle with automatic Canvas2D fallback on init failure.

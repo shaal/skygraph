@@ -2,7 +2,7 @@
 // sky.js (which stays the app conductor). Pure drawing over already
 // projected az/el points; the only import is the polar screen mapping.
 
-import { polarScreenXY } from "./project.js";
+import { polarScreenXY, radialFrac } from "./project.js";
 
 export const BAND_COLORS = {
   "normal": "#3ddc84",
@@ -37,9 +37,10 @@ export function indexAt(tr, t) {
 export function drawSkyDome(ctx, w, h) {
   const cx = w / 2, cy = h / 2;
   const R = Math.min(w, h) / 2;
-  // Elevation rings at 0 / 30 / 60 degrees.
+  // Elevation rings at 0 / 30 / 60 degrees — placed by the active projection so
+  // tracks always sit on the right ring.
   for (const el of [0, 30, 60]) {
-    const r = ((90 - el) / 90) * R;
+    const r = radialFrac(el) * R;
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.strokeStyle = el === 0 ? "#27345c" : "#1a2542";

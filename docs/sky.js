@@ -32,6 +32,7 @@ import { Recorder } from "./record.js";
 import { GpuSats } from "./gpu-sats.js";
 import { loadTles } from "./sat-feed.js";
 import { createLocalNode, DEFAULT_OBSERVER } from "./local-node.js";
+import { drawBasemap, dragToLatLon, geocode, MAP_GROUND_RADIUS_M } from "./basemap.js";
 
 // Where this node observes from. The reference node (DEFAULT_OBSERVER, in
 // ./local-node.js) is the fallback; a saved choice or a fresh geolocation grant
@@ -116,7 +117,13 @@ async function main() {
   // observer-only (pubkey null). OBSERVER below is a read-through handle into
   // the node; there is no separate observer state.
   const node = createLocalNode({ observer: await resolveObserver() });
-  const OBSERVER = node.observer;
+  // `let`, not `const`: a live relocate (drag / search / manual entry) re-points
+  // this binding — and `obsEcef` below — to a new frozen observer with no page
+  // reload. Every per-frame reader closes over these bindings, so reassigning
+  // them propagates everywhere; the few subsystems that captured a copy (the
+  // feed centre, the wasm projector, the satellite propagator) are refreshed
+  // explicitly in relocateLive().
+  let OBSERVER = node.observer;
   const canvas = document.getElementById("sky");
   const gpuCanvas = document.getElementById("sky-gpu");
   const view3dCanvas = document.getElementById("sky3d");
@@ -129,14 +136,24 @@ async function main() {
   const satTbody = document.querySelector("#sat-table tbody");
   const details = document.getElementById("details");
   const passList = document.getElementById("pass-list");
-  const obsName = OBSERVER.source === "geo" ? "📍 your location"
-    : OBSERVER.source === "manual" ? "📍 manual location"
-    : `${OBSERVER.name} (default)`;
-  document.getElementById("observer-label").textContent =
-    `observer: ${obsName} (${OBSERVER.lat.toFixed(4)}, ${OBSERVER.lon.toFixed(4)}, ${OBSERVER.alt_m} m)`;
+  function refreshObserverUi() {
+    const obsName = OBSERVER.source === "geo" ? "📍 your location"
+      : OBSERVER.source === "manual" ? "📍 manual location"
+      : `${OBSERVER.name} (default)`;
+    const lab = document.getElementById("observer-label");
+    if (lab) lab.textContent =
+      `observer: ${obsName} (${OBSERVER.lat.toFixed(4)}, ${OBSERVER.lon.toFixed(4)}, ${OBSERVER.alt_m} m)`;
+    const latIn = document.getElementById("opt-lat");
+    const lonIn = document.getElementById("opt-lon");
+    const altIn = document.getElementById("opt-alt");
+    if (latIn) latIn.value = OBSERVER.lat.toFixed(4);
+    if (lonIn) lonIn.value = OBSERVER.lon.toFixed(4);
+    if (altIn) altIn.value = OBSERVER.alt_m;
+  }
+  refreshObserverUi();
 
   // Prefer wasm when ./pkg is present (projection + SGP4 + scoring + §13).
-  const obsEcef = geodeticToEcef(OBSERVER.lat, OBSERVER.lon, OBSERVER.alt_m);
+  let obsEcef = geodeticToEcef(OBSERVER.lat, OBSERVER.lon, OBSERVER.alt_m);
   const wasm = await loadWasmEngine(OBSERVER);
   const scorer = wasm?.AnomalyScorer ? new wasm.AnomalyScorer() : null;
   document.getElementById("engine").textContent = wasm
@@ -147,6 +164,44 @@ async function main() {
   let sun = sunPosition(t, OBSERVER.lat, OBSERVER.lon);
   let selected = null;       // selected aircraft track
   let selectedSat = -1;      // selected satellite index (exclusive with above)
+
+  // Viewpoint relocation: drag the 2D map (or search a place) to look from
+  // somewhere else. The dome is a sky projection, so a drag pans the basemap
+  // for feedback and commits the new observer on release — a reload re-projects
+  // the whole pipeline, mirroring the manual-location path. dx/dy are live pan.
+  const mapDrag = { active: false, moved: false, dx: 0, dy: 0, sx: 0, sy: 0, lat: 0, lon: 0 };
+
+  // Move the viewpoint with NO page reload. Re-points every observer-dependent
+  // piece in place: the OBSERVER/obsEcef bindings (so all per-frame projection
+  // picks up the new site), the wasm projector, the ADS-B feed centre (old
+  // aircraft are dropped and a fresh poll repopulates around the new spot), the
+  // satellite propagator + passes, the sun, the 3D ground map, and the labels.
+  // The 2D basemap reads OBSERVER live each frame, so it recenters instantly.
+  async function relocateLive(lat, lon, opts = {}) {
+    if (![lat, lon].every(Number.isFinite) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
+    const { alt = OBSERVER.alt_m, name = "manual", source = "manual", clearSaved = false } = opts;
+    const next = Object.freeze({ name, lat, lon, alt_m: Number.isFinite(alt) ? alt : OBSERVER.alt_m, source });
+    if (clearSaved) { try { localStorage.removeItem(LOCATION_KEY); } catch (_e) { /* ignore */ } }
+    else saveObserver(next);
+
+    OBSERVER = next;
+    obsEcef = geodeticToEcef(next.lat, next.lon, next.alt_m);
+    wasm?.setObserver?.(next);
+    sun = sunPosition(t, next.lat, next.lon);
+
+    // Drop old-location aircraft; the immediate poll repopulates the new centre.
+    selected = null;
+    conflicts = [];
+    feed.obs = next;
+    feed.byIcao.clear();
+    feed._pollAdsb();
+    feed._pollWx();
+
+    loadSats(CFG.tleGroup);        // rebuild the propagator + passes at the new site (TLEs cached)
+    sky3d?.setObserver?.(next);    // re-center the 3D ground map (no-op when 2D)
+    refreshObserverUi();
+    return true;
+  }
   let lastStatusSec = 0;
   let lastPassRender = 0;
   let conflicts = [];
@@ -302,6 +357,8 @@ async function main() {
       s.init(view3dCanvas, {
         onSelectAircraft: (tr) => { selected = selected === tr ? null : tr; selectedSat = -1; showDetails(); },
         onSelectSat: (i) => { selectedSat = selectedSat === i ? -1 : i; selected = null; showDetails(); },
+        observer: OBSERVER, // ground-map centre
+        cfg: CFG,           // live basemap opacity/style/enable, read per frame
       });
       sky3d = s;
       document.body.classList.add("view-3d");
@@ -325,19 +382,26 @@ async function main() {
     onLocate: async () => {
       const o = await geolocate({ enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
       if (!o) return false;
-      saveObserver(o);
-      location.reload();
+      await relocateLive(o.lat, o.lon, { alt: o.alt_m, name: o.name ?? "geo", source: "geo" });
       return true;
     },
     onManualLocation: (lat, lon, alt) => {
+      // Synchronous validity check (settings.js flags the inputs on false); the
+      // actual move is the live, no-reload relocateLive.
       if (![lat, lon].every(Number.isFinite) || lat < -90 || lat > 90 || lon < -180 || lon > 180) return false;
-      saveObserver({ name: "manual", lat, lon, alt_m: Number.isFinite(alt) ? alt : DEFAULT_OBSERVER.alt_m, source: "manual" });
-      location.reload();
+      relocateLive(lat, lon, { alt });
       return true;
     },
     onResetLocation: () => {
-      try { localStorage.removeItem(LOCATION_KEY); } catch (_e) { /* ignore */ }
-      location.reload();
+      relocateLive(DEFAULT_OBSERVER.lat, DEFAULT_OBSERVER.lon,
+        { alt: DEFAULT_OBSERVER.alt_m, name: DEFAULT_OBSERVER.name, source: "default", clearSaved: true });
+    },
+    // "Go to place": free geocode (Photon/OSM, or a bare "lat, lon"), then move
+    // the viewpoint live (no reload). false => not found.
+    onSearchLocation: async (q) => {
+      const r = await geocode(q);
+      if (!r) return false;
+      return relocateLive(r.lat, r.lon);
     },
   });
   if (CFG.webgpuSats) {
@@ -369,6 +433,36 @@ async function main() {
   view2dBtn.addEventListener("click", () => applyView(false));
   syncViewToggle(CFG.view3d);
   if (CFG.view3d) applyView(true); // restore 3D from a previous session
+
+  // Drag the 2D dome to move the viewpoint. The 2D canvas has no click-select
+  // of its own (the side tables select tracks), so the drag is unambiguous. In
+  // 3D the mouse orbits the camera, so relocation there is via "Go to place".
+  canvas.style.cursor = "grab";
+  canvas.addEventListener("pointerdown", (e) => {
+    if (CFG.view3d || e.button !== 0) return;
+    mapDrag.active = true; mapDrag.moved = false;
+    mapDrag.dx = 0; mapDrag.dy = 0; mapDrag.sx = e.clientX; mapDrag.sy = e.clientY;
+    mapDrag.lat = OBSERVER.lat; mapDrag.lon = OBSERVER.lon;
+    try { canvas.setPointerCapture(e.pointerId); } catch (_e) { /* unsupported */ }
+    canvas.style.cursor = "grabbing";
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!mapDrag.active) return;
+    mapDrag.dx = e.clientX - mapDrag.sx;
+    mapDrag.dy = e.clientY - mapDrag.sy;
+    if (Math.hypot(mapDrag.dx, mapDrag.dy) > 3) mapDrag.moved = true;
+    const R = Math.min(canvas.clientWidth, canvas.clientHeight) / 2;
+    const ll = dragToLatLon(OBSERVER.lat, OBSERVER.lon, mapDrag.dx, mapDrag.dy, R, MAP_GROUND_RADIUS_M);
+    mapDrag.lat = ll.lat; mapDrag.lon = ll.lon;
+  });
+  const endDrag = () => {
+    if (!mapDrag.active) return;
+    mapDrag.active = false;
+    canvas.style.cursor = "grab";
+    if (mapDrag.moved) relocateLive(mapDrag.lat, mapDrag.lon);
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
 
   // On-screen "My sky / Network sky" switch (top-left), mirroring the 2D/3D
   // control. "Network sky" overlays peers' tracks on top of the local view
@@ -557,8 +651,8 @@ async function main() {
   // Project a prediction cone's lat/lon paths into az/el for drawing.
   function projectCone(cone) {
     const proj = (pts) => pts.map((p) => {
-      const [az, el] = observerFrameJs(OBSERVER, obsEcef, p.lat, p.lon, p.alt_m);
-      return { az, el };
+      const [az, el, range] = observerFrameJs(OBSERVER, obsEcef, p.lat, p.lon, p.alt_m);
+      return { az, el, range }; // range carried for 3D depth; the 2D drawCone ignores it
     });
     return { center: proj(cone.center), left: proj(cone.left), right: proj(cone.right) };
   }
@@ -784,7 +878,39 @@ async function main() {
     for (const v of remoteViews()) {
       if (v.el > 0) remoteList.push({ az: v.az, el: v.el, range: v.range_m });
     }
-    sky3d.update({ aircraft: acList, sats: satList, remote: remoteList, sun: sunBody, moon: moonBody, showLabels: CFG.labels });
+    // Past-path trails (mirrors the 2D fading trail): the last trailLen samples
+    // of each aircraft, above the horizon, with range for depth. Aircraft only,
+    // like the 2D dome — satellites and network rings carry no trail.
+    let trails = null;
+    if (CFG.trails) {
+      trails = [];
+      for (const tr of tracks) {
+        const n = tr.points.length;
+        if (!n) continue;
+        const pts = [];
+        for (let j = Math.max(0, n - CFG.trailLen); j < n; j++) {
+          const q = tr.points[j];
+          if (q.az === undefined || !(q.el > 0)) continue;
+          pts.push({ az: q.az, el: q.el, range: q.range });
+        }
+        if (pts.length >= 2) trails.push({ pts, color: tr.color || LIVE_COLOR, selected: tr === selected });
+      }
+    }
+    // Predicted "expected path" for the selected aircraft — the CPA cone, same
+    // gating as 2D (not in replay, Conflict alerts on, something selected).
+    let predicted = null;
+    if (!replay.active && CFG.conflicts && selected) {
+      // Shorter horizon than the 2D dome (30 s vs 90 s): in the depth-compressed
+      // 3D scene a level plane's long forecast sweeps down to the horizon and
+      // reads as a dive, so a short forward stub is clearer (sky3d also clips it
+      // at the horizon so it never crosses the ground plane).
+      const cone = predictCone(selected, t, 30);
+      if (cone) predicted = { ...projectCone(cone), color: selected.color || LIVE_COLOR };
+    }
+    sky3d.update({
+      aircraft: acList, sats: satList, remote: remoteList, sun: sunBody, moon: moonBody,
+      showLabels: CFG.labels, trails, predicted,
+    });
     sky3d.render();
   }
 
@@ -796,6 +922,26 @@ async function main() {
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
+    // Faint geographic basemap behind the dome: fills the horizon circle,
+    // north-up and compass-aligned. Drawn first so the grid, tracks, and insets
+    // all sit on top. During a relocate-drag it pans with the cursor (the
+    // committed move happens on pointerup); attribution is mandatory.
+    if (CFG.basemap && CFG.basemapOpacity > 0) {
+      const R = Math.min(w, h) / 2;
+      const attr = drawBasemap(ctx, {
+        cx: w / 2, cy: h / 2, radiusPx: R, lat: OBSERVER.lat, lon: OBSERVER.lon,
+        style: CFG.basemapStyle, opacity: CFG.basemapOpacity / 100, clip: "circle",
+        panX: mapDrag.active ? mapDrag.dx : 0, panY: mapDrag.active ? mapDrag.dy : 0,
+        followProjection: true, // warp the map disc to match the dome projection
+      });
+      if (attr) {
+        ctx.save();
+        ctx.globalAlpha = 0.5; ctx.fillStyle = "#6b7896";
+        ctx.font = "9px monospace"; ctx.textAlign = "right";
+        ctx.fillText(attr, w - 6, h - 6);
+        ctx.restore();
+      }
+    }
     drawSkyDome(ctx, w, h);
     if (CFG.sunmoon) drawSunMoon(w, h);
     // Network sky underneath the local layer: peers' rings frame, but never
@@ -853,6 +999,18 @@ async function main() {
     if (mesh && rfSnap) drawRfIntegrity(ctx, rfSnap, w, h);
     // rUv leaderboard inset (T4.2), top-right: ranked contributors (2D view only).
     if (CFG.leaderboard && mesh && leaderboardSnap) drawLeaderboard(ctx, leaderboardSnap, w, h);
+    // Relocate-drag readout: the coordinates the viewpoint jumps to on release.
+    if (mapDrag.active && mapDrag.moved) {
+      const txt = `◎ release to look from  ${mapDrag.lat.toFixed(3)}, ${mapDrag.lon.toFixed(3)}`;
+      ctx.save();
+      ctx.font = "bold 12px monospace"; ctx.textAlign = "center";
+      const tw = ctx.measureText(txt).width;
+      ctx.fillStyle = "rgba(7,9,15,0.82)";
+      ctx.fillRect(w / 2 - tw / 2 - 8, 10, tw + 16, 22);
+      ctx.fillStyle = "#c7d2e8";
+      ctx.fillText(txt, w / 2, 25);
+      ctx.restore();
+    }
   }
 
   // Build the signed-Observation drafts for what this node sees right now: its

@@ -197,9 +197,26 @@
     <label><input type="checkbox" id="opt-conflicts"> Conflict alerts (CPA)</label>
     <label title="Mini-map of where mesh nodes have eyes — coverage density + gaps (2D, needs the built app)"><input type="checkbox" id="opt-coverage"> Network coverage map</label>
     <label title="Ranked contributors by rUv — uptime + unique coverage + early-adopter, a non-redeemable metric (2D, needs the built app)"><input type="checkbox" id="opt-leaderboard"> rUv contributor leaderboard</label>
+    <h2>Background map</h2>
+    <label title="A faint geographic map behind the dome (2D) and as the ground (3D). Tiles fetched by your browser from OSM/CARTO — never the mesh."><input type="checkbox" id="opt-basemap"> Faint map backdrop (2D &amp; 3D)</label>
+    <label for="opt-basemap-opacity">Map opacity: <span id="opt-basemap-out">35</span>%</label>
+    <input type="range" id="opt-basemap-opacity" min="0" max="100" step="1">
+    <label for="opt-basemap-style">Map style</label>
+    <select id="opt-basemap-style">
+      <option value="dark">Dark (muted)</option>
+      <option value="light">Light (muted)</option>
+      <option value="streets">Streets (OSM)</option>
+    </select>
     <h2>Settings</h2>
     <label for="opt-trail-len">Trail length: <span id="opt-trail-out">150</span> samples</label>
     <input type="range" id="opt-trail-len" min="30" max="600" step="10">
+    <label for="opt-projection" title="How the all-sky hemisphere maps onto the 2D dome (zenith centre, horizon rim). 3D view is unaffected.">Dome projection (2D)</label>
+    <select id="opt-projection">
+      <option value="fisheye">Fisheye — equidistant (default)</option>
+      <option value="stereographic">Stereographic — conformal</option>
+      <option value="orthographic">Orthographic — hemisphere</option>
+      <option value="equalArea">Equal-area — Lambert</option>
+    </select>
     <label for="opt-tle-group">Satellite TLE group</label>
     <select id="opt-tle-group">
       <option value="visual">visual (~160 brightest)</option>
@@ -214,6 +231,11 @@
     <button id="opt-locate" title="Centre the sky on this device's location (asks for permission)">
       📍 Use my location
     </button>
+    <label for="opt-place">Go to place — drag the 2D sky too</label>
+    <div class="row">
+      <input type="text" id="opt-place" placeholder="address, or 35.68, 139.69">
+      <button id="opt-place-go" title="Free keyless geocoding (Photon / OpenStreetMap) — relocates the viewpoint">Go</button>
+    </div>
     <div class="row">
       <label for="opt-lat">Latitude<input type="number" id="opt-lat" step="0.0001" min="-90" max="90"></label>
       <label for="opt-lon">Longitude<input type="number" id="opt-lon" step="0.0001" min="-180" max="180"></label>
@@ -226,6 +248,8 @@
       weather 10 min (Open-Meteo) · Kp 15 min (NOAA SWPC) ·
       TLEs 6 h (CelesTrak) · routes on selection (adsbdb, 24 h cache) ·
       replay buffer ~1 h (IndexedDB). Settings persist in this browser.
+      Drag the 2D sky — or search above — to look from another place;
+      Reset returns home. Map tiles © OpenStreetMap / © CARTO.
     </div>
   </div>
   <!-- three.js for the optional 3D view (./sky3d.js), loaded on demand. The

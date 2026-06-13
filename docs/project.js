@@ -43,13 +43,32 @@ export function observerFrameJs(obs, obsEcef, lat, lon, altM) {
   return [az, el, range];
 }
 
-// Polar "fisheye" all-sky mapping: zenith at the centre, horizon on the
-// inscribed circle, azimuth 0 = North = up.
+// All-sky azimuthal projections: zenith at the centre, the horizon on the
+// inscribed circle, azimuth 0 = North = up. The radial law (zenith angle ->
+// fraction of the dome radius) is switchable in the ⚙ drawer; each is
+// normalised so the horizon (z = 90°) lands exactly on the rim.
+const DOME_PROJECTIONS = {
+  fisheye:       (z) => z / 90,                               // equidistant — linear in zenith angle (classic all-sky)
+  stereographic: (z) => Math.tan((z * DEG) / 2),              // conformal — preserves shapes/circles, spreads the zenith
+  orthographic:  (z) => Math.sin(z * DEG),                    // hemisphere from outside — compresses near the horizon
+  equalArea:     (z) => Math.SQRT2 * Math.sin((z * DEG) / 2), // Lambert — preserves area
+};
+let domeProjection = "fisheye";
+export function setProjection(mode) { domeProjection = DOME_PROJECTIONS[mode] ? mode : "fisheye"; }
+export function projectionMode() { return domeProjection; }
+
+// Fraction of the dome radius for an elevation under the active projection
+// (1 = horizon). Clamped so points just below the horizon stay finite
+// (stereographic/equal-area would otherwise blow up near el = -90).
+export function radialFrac(elDeg) {
+  const z = 90 - Math.max(-90, Math.min(90, elDeg)); // zenith angle: 0 = straight up, 90 = horizon
+  return Math.min(1.8, DOME_PROJECTIONS[domeProjection](z));
+}
+
 export function polarScreenXY(azDeg, elDeg, width, height) {
   const cx = width / 2, cy = height / 2;
   const radius = Math.min(width, height) / 2;
-  const el = Math.max(-90, Math.min(90, elDeg));
-  const r = ((90 - el) / 90) * radius;
+  const r = radialFrac(elDeg) * radius;
   const az = azDeg * DEG;
   return [cx + r * Math.sin(az), cy - r * Math.cos(az), elDeg >= 0];
 }
@@ -60,9 +79,15 @@ export async function loadWasmEngine(obs) {
   try {
     const mod = await import("./pkg/sky_monitor_wasm.js");
     await mod.default(); // init wasm
-    const projector = new mod.SkyProjector(obs.lat, obs.lon, obs.alt_m);
+    let projector = new mod.SkyProjector(obs.lat, obs.lon, obs.alt_m);
     return {
       projectBatch: (flat) => projector.project_batch(flat),
+      // Re-point the projector to a new observer for a live relocate (no reload).
+      setObserver: (o) => {
+        const next = new mod.SkyProjector(o.lat, o.lon, o.alt_m);
+        try { projector.free?.(); } catch (_e) { /* already freed */ }
+        projector = next;
+      },
       SatPropagator: mod.SatPropagator,
       AnomalyScorer: mod.AnomalyScorer,
       // §13/§15: canonical 32-dim track embedding + indexer-calibrated
